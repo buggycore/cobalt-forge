@@ -1,0 +1,14 @@
+{
+  "name": "cobalt-forge",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Standalone C++20 epoll GitHub-compatible git forge with Node 22 trial launcher",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "start": "node --experimental-strip-types main.ts"
+  }
+}
