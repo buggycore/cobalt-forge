@@ -45,9 +45,6 @@ struct GitObj {
     std::vector<uint8_t> compressed;
     Oid tree_oid{};
     std::vector<Oid> parents;
-    std::string message;
-    std::string author;
-    std::string committer;
     Oid tag_target{};
     ObjType tag_target_type = ObjType::Commit;
     bool meta_parsed = false;
@@ -146,6 +143,16 @@ struct Repo {
         }
         return nullptr;
     }
+    const Issue* find_issue_const(uint32_t number) const noexcept {
+        if (number >= 1 && number <= issues.size()) {
+            const Issue* ptr = issues[number - 1].get();
+            if (ptr && ptr->number == number) return ptr;
+        }
+        for (const auto& up : issues) {
+            if (up->number == number) return up.get();
+        }
+        return nullptr;
+    }
 
     // Performance caches
     uint64_t ref_version = 1;
@@ -184,6 +191,7 @@ public:
     // Repositories
     Repo* create_repo(const std::string& name, bool is_private, const std::string& description, const std::string& default_branch = "main");
     Repo* find_repo(std::string_view owner, std::string_view name) noexcept;
+    const Repo* find_repo_const(std::string_view owner, std::string_view name) const noexcept;
     bool delete_repo(std::string_view owner, std::string_view name);
     const std::vector<Repo*>& list_repos() const noexcept { return repo_order_; }
 
@@ -207,6 +215,7 @@ public:
     Oid put_object(Repo& repo, ObjType type, std::vector<uint8_t> raw, std::vector<uint8_t> compressed = {});
     const std::vector<uint8_t>& ensure_compressed(GitObj& obj);
     void parse_obj_meta(GitObj& obj);
+    static std::string_view commit_message(const GitObj& obj) noexcept;
 
     bool unpack_pack(Repo& repo, const uint8_t* data, size_t len, std::string& err);
     std::vector<uint8_t> build_pack(Repo& repo, const std::vector<Oid>& oids);

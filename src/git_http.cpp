@@ -325,28 +325,32 @@ void handle_info_refs(ForgeStore& store, Repo& repo, const HttpRequest& req, Htt
     }
 
     if (service == "git-receive-pack") {
-        if (req.keep_alive && repo.cached_recv_refs_version == repo.ref_version && !repo.cached_recv_refs_http.empty()) {
-            res.set_prebuilt(repo.cached_recv_refs_http);
-            return;
-        }
-        static const std::string kCaps = "report-status side-band-64k delete-refs ofs-delta";
+        static constexpr std::string_view kCaps = "report-status side-band-64k delete-refs ofs-delta";
         std::string body;
-        body.reserve(256 + repo.refs.size() * 80);
+        body.reserve(160 + repo.refs.size() * 72);
         append_pkt(body, "# service=git-receive-pack\n");
         body.append("0000");
         if (repo.refs.empty()) {
-            std::string line = std::string(40, '0') + " capabilities^{}";
-            line.push_back('\0');
-            line += kCaps;
-            line.push_back('\n');
-            append_pkt(body, line);
+            char line[160];
+            std::memset(line, '0', 40);
+            std::memcpy(line + 40, " capabilities^{}\0", 17);
+            std::memcpy(line + 57, kCaps.data(), kCaps.size());
+            line[57 + kCaps.size()] = '\n';
+            append_pkt(body, std::string_view(line, 58 + kCaps.size()));
         } else {
             bool first = true;
+            char hex40[40];
+            std::string line;
+            line.reserve(160);
             for (const auto& [name, oid] : repo.refs) {
-                std::string line = oid.hex() + " " + name;
+                line.clear();
+                oid.write_hex(hex40);
+                line.append(hex40, 40);
+                line.push_back(' ');
+                line.append(name);
                 if (first) {
                     line.push_back('\0');
-                    line += kCaps;
+                    line.append(kCaps);
                     first = false;
                 }
                 line.push_back('\n');
@@ -355,10 +359,6 @@ void handle_info_refs(ForgeStore& store, Repo& repo, const HttpRequest& req, Htt
         }
         body.append("0000");
         build_http_response(res, 200, "application/x-git-receive-pack-advertisement", body, store.next_request_id(), req.keep_alive);
-        if (req.keep_alive) {
-            repo.cached_recv_refs_http = res.owned_raw;
-            repo.cached_recv_refs_version = repo.ref_version;
-        }
         return;
     }
 
@@ -672,6 +672,127 @@ void handle_receive_pack(ForgeStore& store, Repo& repo, const HttpRequest& req, 
 }
 
 } // namespace
+
+bool try_git_fast_readonly(const ForgeStore& store, const HttpRequest& req, HttpResponse& res) {
+    if (!req.keep_alive) return false;
+    std::string_view p = req.path;
+    if (p.size() < 12 || p[0] != '/') return false;
+    if (p.size() >= 5 && p.substr(0, 5) == "/api/") return false;
+
+    size_t s1 = p.find('/', 1);
+    if (s1 == std::string_view::npos) return false;
+    std::string_view owner = p.substr(1, s1 - 1);
+
+    size_t s2 = p.find('/', s1 + 1);
+    if (s2 == std::string_view::npos) return false;
+    std::string_view repo_seg = p.substr(s1 + 1, s2 - s1 - 1);
+    std::string_view tail = p.substr(s2);
+
+    bool is_info = (tail == "/info/refs" && req.method == "GET");
+    bool is_upload = (!is_info && tail == "/git-upload-pack" && req.method == "POST");
+    if (!is_info && !is_upload) return false;
+
+    if (repo_seg.size() > 4 && repo_seg.substr(repo_seg.size() - 4) == ".git") {
+        repo_seg.remove_suffix(4);
+    }
+
+    if (!store.check_auth(req.authorization)) return false;
+    const Repo* repo = store.find_repo_const(owner, repo_seg);
+    if (!repo) return false;
+
+    if (is_info) {
+        if (query_param(req.query, "service") == "git-upload-pack" &&
+            req.git_protocol.find("version=2") != std::string_view::npos) {
+            res.set_prebuilt(static_v2_info_refs_http());
+            return true;
+        }
+        return false;
+    }
+
+    // Stack-only pkt-line scanner for v2 ls-refs and shallow-1 fetch cache hits
+    std::string_view buf = req.body;
+    size_t pos = 0;
+    std::string_view command;
+    bool in_args = false;
+    bool peel = false, symrefs = false, has_prefix = false;
+    int deepen = 0;
+    int want_count = 0, have_count = 0, shallow_count = 0;
+    Oid want0{};
+
+    while (pos + 4 <= buf.size()) {
+        unsigned len = 0;
+        for (int i = 0; i < 4; ++i) {
+            int n = hex_nibble(buf[pos + i]);
+            if (n < 0) return false;
+            len = (len << 4) | static_cast<unsigned>(n);
+        }
+        if (len == 0) {
+            break;
+        } else if (len == 1) {
+            in_args = true;
+            pos += 4;
+        } else if (len == 2) {
+            pos += 4;
+        } else if (len < 4 || pos + len > buf.size()) {
+            return false;
+        } else {
+            std::string_view line = strip_nl(buf.substr(pos + 4, len - 4));
+            pos += len;
+            if (!in_args) {
+                if (line.size() > 8 && line.substr(0, 8) == "command=") {
+                    command = line.substr(8);
+                }
+            } else {
+                if (command == "ls-refs") {
+                    if (line == "peel") peel = true;
+                    else if (line == "symrefs") symrefs = true;
+                    else if (line.size() >= 11 && line.substr(0, 11) == "ref-prefix ") has_prefix = true;
+                } else if (command == "fetch") {
+                    if (line.size() == 45 && line.substr(0, 5) == "want ") {
+                        if (want_count == 0) {
+                            if (!parse_oid(line.substr(5), want0)) return false;
+                        }
+                        ++want_count;
+                    } else if (line.size() == 45 && line.substr(0, 5) == "have ") {
+                        ++have_count;
+                    } else if (line.size() == 48 && line.substr(0, 8) == "shallow ") {
+                        ++shallow_count;
+                    } else if (line.size() > 7 && line.substr(0, 7) == "deepen ") {
+                        int d = 0;
+                        for (size_t k = 7; k < line.size(); ++k) {
+                            if (line[k] < '0' || line[k] > '9') return false;
+                            d = d * 10 + (line[k] - '0');
+                        }
+                        deepen = d;
+                    }
+                }
+            }
+        }
+    }
+
+    if (command == "ls-refs") {
+        if (peel && symrefs && !has_prefix &&
+            repo->cached_ls_refs_version == repo->ref_version &&
+            !repo->cached_ls_refs_http.empty()) {
+            res.set_prebuilt(repo->cached_ls_refs_http);
+            return true;
+        }
+        return false;
+    }
+
+    if (command == "fetch") {
+        if (deepen == 1 && want_count == 1 && have_count == 0 && shallow_count == 0) {
+            auto cit = repo->shallow1_http_cache.find(want0);
+            if (cit != repo->shallow1_http_cache.end()) {
+                res.set_prebuilt(cit->second);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    return false;
+}
 
 bool handle_git_http(ForgeStore& store, const HttpRequest& req, HttpResponse& res) {
     // Match /{owner}/{repo}.git/(info/refs|git-upload-pack|git-receive-pack)

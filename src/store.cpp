@@ -105,8 +105,8 @@ Repo* ForgeStore::create_repo(
     repo->is_private = is_private;
     repo->default_branch = default_branch.empty() ? "main" : default_branch;
     repo->created_at = next_timestamp();
-    repo->objects.reserve(64);
-    repo->issues.reserve(32);
+    repo->objects.reserve(1024);
+    repo->issues.reserve(256);
     Repo* ptr = repo.get();
     repo_by_db_id_[ptr->db_id] = ptr;
     repo_order_.push_back(ptr);
@@ -122,6 +122,14 @@ Repo* ForgeStore::find_repo(std::string_view owner, std::string_view name) noexc
     if (it == repos_.end()) return nullptr;
     last_repo_ = it->second.get();
     return last_repo_;
+}
+
+const Repo* ForgeStore::find_repo_const(std::string_view owner, std::string_view name) const noexcept {
+    if (owner != viewer_login_) return nullptr;
+    if (last_repo_ && last_repo_->name == name) return last_repo_;
+    auto it = repos_.find(name);
+    if (it == repos_.end()) return nullptr;
+    return it->second.get();
 }
 
 bool ForgeStore::delete_repo(std::string_view owner, std::string_view name) {
@@ -233,19 +241,15 @@ void ForgeStore::parse_obj_meta(GitObj& obj) {
             if (nl == std::string_view::npos) nl = sv.size();
             std::string_view line = sv.substr(pos, nl - pos);
             pos = (nl < sv.size()) ? nl + 1 : sv.size();
-            if (line.empty()) {
-                obj.message = std::string(sv.substr(pos));
-                break;
-            }
+            if (line.empty()) break;
             if (line.size() == 45 && line.substr(0, 5) == "tree ") {
                 parse_oid(line.substr(5), obj.tree_oid);
             } else if (line.size() == 47 && line.substr(0, 7) == "parent ") {
                 Oid p;
                 if (parse_oid(line.substr(7), p)) obj.parents.push_back(p);
-            } else if (line.substr(0, 7) == "author ") {
-                obj.author = std::string(line.substr(7));
-            } else if (line.substr(0, 10) == "committer ") {
-                obj.committer = std::string(line.substr(10));
+            } else if (line[0] == 'a' || line[0] == 'c') {
+                // In git commits, tree and parent headers always precede author/committer
+                break;
             }
         }
     } else if (obj.type == ObjType::Tag) {
@@ -270,6 +274,13 @@ void ForgeStore::parse_obj_meta(GitObj& obj) {
     }
 }
 
+std::string_view ForgeStore::commit_message(const GitObj& obj) noexcept {
+    std::string_view sv(reinterpret_cast<const char*>(obj.raw.data()), obj.raw.size());
+    size_t blank = sv.find("\n\n");
+    if (blank == std::string_view::npos) return {};
+    return sv.substr(blank + 2);
+}
+
 Oid ForgeStore::put_object(
     Repo& repo, ObjType type, std::vector<uint8_t> raw, std::vector<uint8_t> compressed) {
     Oid oid = hash_object(type, raw.data(), raw.size());
@@ -284,9 +295,6 @@ Oid ForgeStore::put_object(
     obj.type = type;
     obj.raw = std::move(raw);
     obj.compressed = std::move(compressed);
-    if (type == ObjType::Commit || type == ObjType::Tag) {
-        parse_obj_meta(obj);
-    }
     repo.objects.emplace(oid, std::move(obj));
     return oid;
 }
@@ -435,8 +443,41 @@ bool ForgeStore::unpack_pack(Repo& repo, const uint8_t* data, size_t len, std::s
         std::vector<uint8_t> delta;
     };
 
+    struct SmallOff {
+        size_t offset = 0;
+        Oid oid{};
+    };
+    SmallOff small_offs[16];
+    size_t small_count = 0;
     std::unordered_map<size_t, Oid> offset_to_oid;
-    bool has_deltas = false;
+    auto record_offset = [&](size_t off, const Oid& oid) {
+        if (small_count < 16) {
+            small_offs[small_count++] = SmallOff{off, oid};
+        } else {
+            if (offset_to_oid.empty()) {
+                offset_to_oid.reserve(count);
+                for (size_t i = 0; i < small_count; ++i) {
+                    offset_to_oid.emplace(small_offs[i].offset, small_offs[i].oid);
+                }
+            }
+            offset_to_oid[off] = oid;
+        }
+    };
+    auto lookup_offset = [&](size_t off, Oid& out_oid) -> bool {
+        if (offset_to_oid.empty()) {
+            for (size_t i = 0; i < small_count; ++i) {
+                if (small_offs[i].offset == off) {
+                    out_oid = small_offs[i].oid;
+                    return true;
+                }
+            }
+            return false;
+        }
+        auto it = offset_to_oid.find(off);
+        if (it == offset_to_oid.end()) return false;
+        out_oid = it->second;
+        return true;
+    };
     std::vector<PendingDelta> pending_deltas;
 
     size_t pos = 12;
@@ -467,13 +508,10 @@ bool ForgeStore::unpack_pack(Repo& repo, const uint8_t* data, size_t len, std::s
                 err = "zlib inflate failed";
                 return false;
             }
-            std::vector<uint8_t> comp(data + pos, data + pos + consumed);
             pos += consumed;
-            Oid oid = put_object(repo, static_cast<ObjType>(type_code), std::move(raw), std::move(comp));
-            if (count > 3 || has_deltas) offset_to_oid[entry_offset] = oid;
-            else offset_to_oid.emplace(entry_offset, oid);
+            Oid oid = put_object(repo, static_cast<ObjType>(type_code), std::move(raw));
+            record_offset(entry_offset, oid);
         } else if (type_code == 6) {
-            has_deltas = true;
             if (pos >= body_end) { err = "truncated ofs-delta"; return false; }
             uint8_t b = data[pos++];
             size_t back = b & 0x7fu;
@@ -491,9 +529,9 @@ bool ForgeStore::unpack_pack(Repo& repo, const uint8_t* data, size_t len, std::s
             }
             pos += consumed;
             size_t base_off = entry_offset - back;
-            auto bit = offset_to_oid.find(base_off);
-            if (bit != offset_to_oid.end()) {
-                auto oit = repo.objects.find(bit->second);
+            Oid base_oid{};
+            if (lookup_offset(base_off, base_oid)) {
+                auto oit = repo.objects.find(base_oid);
                 if (oit != repo.objects.end()) {
                     std::vector<uint8_t> resolved;
                     if (!apply_delta(oit->second.raw, delta, resolved)) {
@@ -501,13 +539,12 @@ bool ForgeStore::unpack_pack(Repo& repo, const uint8_t* data, size_t len, std::s
                         return false;
                     }
                     Oid oid = put_object(repo, oit->second.type, std::move(resolved));
-                    offset_to_oid[entry_offset] = oid;
+                    record_offset(entry_offset, oid);
                     continue;
                 }
             }
             pending_deltas.push_back(PendingDelta{entry_offset, true, base_off, {}, std::move(delta)});
         } else if (type_code == 7) {
-            has_deltas = true;
             if (pos + 20 > body_end) { err = "truncated ref-delta"; return false; }
             Oid base_oid;
             std::memcpy(base_oid.bytes.data(), data + pos, 20);
@@ -527,7 +564,7 @@ bool ForgeStore::unpack_pack(Repo& repo, const uint8_t* data, size_t len, std::s
                     return false;
                 }
                 Oid oid = put_object(repo, oit->second.type, std::move(resolved));
-                offset_to_oid[entry_offset] = oid;
+                record_offset(entry_offset, oid);
             } else {
                 pending_deltas.push_back(PendingDelta{entry_offset, false, 0, base_oid, std::move(delta)});
             }
@@ -543,9 +580,7 @@ bool ForgeStore::unpack_pack(Repo& repo, const uint8_t* data, size_t len, std::s
         for (auto& pd : pending_deltas) {
             Oid base_oid = pd.base_oid;
             if (pd.is_ofs) {
-                auto it = offset_to_oid.find(pd.base_offset);
-                if (it == offset_to_oid.end()) { remaining.push_back(std::move(pd)); continue; }
-                base_oid = it->second;
+                if (!lookup_offset(pd.base_offset, base_oid)) { remaining.push_back(std::move(pd)); continue; }
             }
             auto oit = repo.objects.find(base_oid);
             if (oit == repo.objects.end()) { remaining.push_back(std::move(pd)); continue; }
@@ -555,7 +590,7 @@ bool ForgeStore::unpack_pack(Repo& repo, const uint8_t* data, size_t len, std::s
                 return false;
             }
             Oid oid = put_object(repo, oit->second.type, std::move(resolved));
-            offset_to_oid[pd.offset] = oid;
+            record_offset(pd.offset, oid);
         }
         if (remaining.size() == before) {
             err = "unresolved delta base";
@@ -1290,9 +1325,9 @@ const std::string& ForgeStore::get_or_build_issue_http(const Repo& repo, Issue& 
         resp += std::to_string(body.size());
         resp += "\r\n\r\n";
         resp += body;
+        stamp_req_id_hex(resp.data() + issue.cached_req_id_offset, ++req_counter_);
         issue.cached_http_response = std::move(resp);
     }
-    stamp_req_id_hex(issue.cached_http_response.data() + issue.cached_req_id_offset, ++req_counter_);
     return issue.cached_http_response;
 }
 

@@ -76,7 +76,121 @@ void split_segments(std::string_view p, std::vector<std::string_view>& out) {
     }
 }
 
+// Fast-path JSON extractor for {"title":"...","body":"..."} without building a JsonValue DOM.
+// Returns true ONLY if the entire JSON object is valid and contains only "title" and optional "body" string fields.
+bool fast_parse_issue_create(std::string_view s, std::string& title_out, std::string& body_out) {
+    size_t i = 0;
+    auto skip_ws = [&]() {
+        while (i < s.size() && (s[i] == ' ' || s[i] == '\t' || s[i] == '\r' || s[i] == '\n')) ++i;
+    };
+    auto parse_str = [&](std::string& out) -> bool {
+        if (i >= s.size() || s[i] != '"') return false;
+        ++i;
+        out.clear();
+        size_t start = i;
+        while (i < s.size()) {
+            unsigned char c = static_cast<unsigned char>(s[i]);
+            if (c == '"') {
+                out.append(s.data() + start, i - start);
+                ++i;
+                return true;
+            }
+            if (c == '\\') {
+                out.append(s.data() + start, i - start);
+                ++i;
+                if (i >= s.size()) return false;
+                char esc = s[i++];
+                switch (esc) {
+                    case '"': out.push_back('"'); break;
+                    case '\\': out.push_back('\\'); break;
+                    case '/': out.push_back('/'); break;
+                    case 'b': out.push_back('\b'); break;
+                    case 'f': out.push_back('\f'); break;
+                    case 'n': out.push_back('\n'); break;
+                    case 'r': out.push_back('\r'); break;
+                    case 't': out.push_back('\t'); break;
+                    default: return false; // fall back to full JSON parser (e.g., \uXXXX)
+                }
+                start = i;
+            } else if (c < 0x20) {
+                return false;
+            } else {
+                ++i;
+            }
+        }
+        return false;
+    };
+
+    skip_ws();
+    if (i >= s.size() || s[i] != '{') return false;
+    ++i;
+    skip_ws();
+    if (i < s.size() && s[i] == '}') return false; // missing title -> fall back
+
+    bool has_title = false;
+    std::string key;
+    for (;;) {
+        skip_ws();
+        if (!parse_str(key)) return false;
+        skip_ws();
+        if (i >= s.size() || s[i] != ':') return false;
+        ++i;
+        skip_ws();
+        if (key == "title") {
+            if (!parse_str(title_out)) return false;
+            has_title = !title_out.empty();
+        } else if (key == "body") {
+            if (i + 4 <= s.size() && s.substr(i, 4) == "null") {
+                body_out.clear();
+                i += 4;
+            } else if (!parse_str(body_out)) {
+                return false;
+            }
+        } else {
+            return false; // e.g., labels -> fall back to full JSON parser
+        }
+        skip_ws();
+        if (i >= s.size()) return false;
+        if (s[i] == ',') {
+            ++i;
+            continue;
+        }
+        if (s[i] == '}') {
+            ++i;
+            break;
+        }
+        return false;
+    }
+    skip_ws();
+    return has_title && i == s.size();
+}
+
 } // namespace
+
+bool try_rest_fast_readonly(const ForgeStore& store, const HttpRequest& req, HttpResponse& res) {
+    if (!req.keep_alive || req.method != "GET") return false;
+    std::string_view p = req.path;
+    if (p.size() <= 14 || p.substr(0, 14) != "/api/v3/repos/") return false;
+    if (!store.check_auth(req.authorization)) return false;
+
+    std::string_view rest = p.substr(14);
+    size_t s1 = rest.find('/');
+    if (s1 == std::string_view::npos) return false;
+    size_t s2 = rest.find('/', s1 + 1);
+    if (s2 == std::string_view::npos) return false;
+    std::string_view after_repo = rest.substr(s2);
+    if (after_repo.size() <= 8 || after_repo.substr(0, 8) != "/issues/") return false;
+    std::string_view num_sv = after_repo.substr(8);
+    uint32_t num = 0;
+    if (num_sv.find('/') != std::string_view::npos || !parse_uint32(num_sv, num)) return false;
+
+    const Repo* repo = store.find_repo_const(rest.substr(0, s1), rest.substr(s1 + 1, s2 - s1 - 1));
+    if (!repo) return false;
+    const Issue* iss = repo->find_issue_const(num);
+    if (!iss || iss->cached_http_response.empty()) return false;
+    res.set_prebuilt(iss->cached_http_response);
+    return true;
+}
 
 bool handle_rest(ForgeStore& store, const HttpRequest& req, HttpResponse& res) {
     std::string_view p = req.path;
@@ -125,6 +239,36 @@ bool handle_rest(ForgeStore& store, const HttpRequest& req, HttpResponse& res) {
                         return true;
                     }
                 }
+            }
+        }
+    }
+
+    // Ultra-fast hot path: POST /api/v3/repos/{owner}/{repo}/issues
+    if (req.method == "POST" && sub.size() > 14 && sub.substr(0, 7) == "/repos/" &&
+        sub.substr(sub.size() - 7) == "/issues") {
+        std::string_view mid = sub.substr(7, sub.size() - 14);
+        size_t s1 = mid.find('/');
+        if (s1 != std::string_view::npos && mid.find('/', s1 + 1) == std::string_view::npos &&
+            mid.find('%') == std::string_view::npos) {
+            std::string title, ibody;
+            if (fast_parse_issue_create(req.body, title, ibody)) {
+                Repo* repo = store.find_repo(mid.substr(0, s1), mid.substr(s1 + 1));
+                if (!repo) {
+                    build_error_json(res, 404, "Not Found", store.next_request_id(), req.keep_alive);
+                    return true;
+                }
+                static const std::vector<std::string> kNoLabels;
+                std::string err;
+                Issue* iss = store.create_issue(*repo, std::move(title), std::move(ibody), kNoLabels, err);
+                if (!iss) {
+                    build_error_json(res, 422, err, store.next_request_id(), req.keep_alive);
+                    return true;
+                }
+                std::string out;
+                out.reserve(128 + iss->title.size() + iss->body.size());
+                ForgeStore::append_issue_json(*repo, *iss, out);
+                build_json_response(res, 201, out, store.next_request_id(), req.keep_alive);
+                return true;
             }
         }
     }
@@ -391,8 +535,8 @@ bool handle_rest(ForgeStore& store, const HttpRequest& req, HttpResponse& res) {
             store.parse_obj_meta(it->second);
             if (!first) out.push_back(',');
             first = false;
-            std::string msg = it->second.message;
-            if (!msg.empty() && msg.back() == '\n') msg.pop_back();
+            std::string_view msg = ForgeStore::commit_message(it->second);
+            if (!msg.empty() && msg.back() == '\n') msg.remove_suffix(1);
             out += "{\"sha\":";
             append_json_escaped(out, cur.hex());
             out += ",\"commit\":{\"message\":";
