@@ -8,14 +8,6 @@
 
 namespace forge {
 
-static inline void stamp_req_id_hex(char* dst, uint64_t v) noexcept {
-    static constexpr char kHex[] = "0123456789abcdef";
-    for (int i = 7; i >= 0; --i) {
-        dst[i] = kHex[v & 0xfu];
-        v >>= 4;
-    }
-}
-
 ForgeStore::ForgeStore(std::string viewer_login, std::string auth_token, int64_t base_epoch)
     : viewer_login_(std::move(viewer_login)),
       auth_token_(std::move(auth_token)),
@@ -28,7 +20,7 @@ ForgeStore::ForgeStore(std::string viewer_login, std::string auth_token, int64_t
     issue_by_db_id_.reserve(1024);
     pull_by_db_id_.reserve(128);
     if (inflateInit(&inf_) == Z_OK) inf_ready_ = true;
-    if (deflateInit(&def_, 1) == Z_OK) def_ready_ = true;
+    if (deflateInit(&def_, 6) == Z_OK) def_ready_ = true;
 }
 
 ForgeStore::~ForgeStore() {
@@ -1315,17 +1307,15 @@ const std::string& ForgeStore::get_or_build_issue_http(const Repo& repo, Issue& 
         append_issue_json(repo, issue, body);
 
         std::string resp;
-        resp.reserve(128 + body.size());
+        resp.reserve(96 + body.size());
         resp += "HTTP/1.1 200 OK\r\n"
                 "Content-Type: application/json\r\n"
                 "X-GitHub-Request-Id: ";
-        issue.cached_req_id_offset = resp.size();
-        resp += "00000000\r\n"
-                "Content-Length: ";
+        resp += std::to_string(++req_counter_);
+        resp += "\r\nContent-Length: ";
         resp += std::to_string(body.size());
         resp += "\r\n\r\n";
         resp += body;
-        stamp_req_id_hex(resp.data() + issue.cached_req_id_offset, ++req_counter_);
         issue.cached_http_response = std::move(resp);
     }
     return issue.cached_http_response;

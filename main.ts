@@ -85,7 +85,8 @@ async function register(port: number): Promise<void> {
 }
 
 async function waitForDone(): Promise<void> {
-  for (let attempt = 0; ; attempt += 1) {
+  for (;;) {
+    await sleep(1_500);
     try {
       const res = await fetch(`${ENV_URL}/done`, { signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
       if (res.ok) {
@@ -95,7 +96,6 @@ async function waitForDone(): Promise<void> {
     } catch {
       // retry on transient errors
     }
-    await sleep(retryDelay(attempt));
   }
 }
 
