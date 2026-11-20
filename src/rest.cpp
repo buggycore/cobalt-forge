@@ -264,7 +264,8 @@ bool handle_rest(ForgeStore& store, const HttpRequest& req, HttpResponse& res) {
                     build_error_json(res, 422, err, store.next_request_id(), req.keep_alive);
                     return true;
                 }
-                std::string out;
+                static std::string out;
+                out.clear();
                 out.reserve(128 + iss->title.size() + iss->body.size());
                 ForgeStore::append_issue_json(*repo, *iss, out);
                 build_json_response(res, 201, out, store.next_request_id(), req.keep_alive);

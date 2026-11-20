@@ -123,7 +123,7 @@ struct Repo {
     std::string created_at;
 
     std::unordered_map<Oid, GitObj, OidHash> objects;
-    std::map<std::string, Oid> refs;
+    std::map<std::string, Oid, std::less<>> refs;
 
     std::unordered_map<std::string, Label> labels;
     std::vector<std::unique_ptr<Issue>> issues;

@@ -78,9 +78,22 @@ const char* ForgeStore::type_name(ObjType t) noexcept {
 
 Oid ForgeStore::hash_object(ObjType type, const uint8_t* data, size_t len) noexcept {
     char hdr[32];
-    int hlen = std::snprintf(hdr, sizeof(hdr), "%s %zu", type_name(type), len);
+    const char* tn = type_name(type);
+    size_t tlen = (type == ObjType::Commit) ? 6 : (type == ObjType::Tag ? 3 : 4);
+    std::memcpy(hdr, tn, tlen);
+    hdr[tlen] = ' ';
+    char num[24];
+    char* p = num + sizeof(num);
+    size_t v = len;
+    do {
+        *--p = static_cast<char>('0' + (v % 10));
+        v /= 10;
+    } while (v != 0);
+    size_t nlen = static_cast<size_t>((num + sizeof(num)) - p);
+    std::memcpy(hdr + tlen + 1, p, nlen);
+    hdr[tlen + 1 + nlen] = '\0';
     Sha1 sha;
-    sha.update(hdr, static_cast<size_t>(hlen) + 1);
+    sha.update(hdr, tlen + nlen + 2);
     sha.update(data, len);
     return sha.final();
 }
@@ -500,8 +513,12 @@ bool ForgeStore::unpack_pack(Repo& repo, const uint8_t* data, size_t len, std::s
                 err = "zlib inflate failed";
                 return false;
             }
+            std::vector<uint8_t> comp;
+            if (count > 16) {
+                comp.assign(data + pos, data + pos + consumed);
+            }
             pos += consumed;
-            Oid oid = put_object(repo, static_cast<ObjType>(type_code), std::move(raw));
+            Oid oid = put_object(repo, static_cast<ObjType>(type_code), std::move(raw), std::move(comp));
             record_offset(entry_offset, oid);
         } else if (type_code == 6) {
             if (pos >= body_end) { err = "truncated ofs-delta"; return false; }
@@ -1246,27 +1263,37 @@ void ForgeStore::append_repo_json(const Repo& repo, std::string& out) {
 
 // Compact Issue JSON containing all fields required by REST, GraphQL cross-checks, and MCP parity.
 void ForgeStore::append_issue_json(const Repo& repo, const Issue& issue, std::string& out) {
-    out += "{\"id\":";
-    out += std::to_string(issue.db_id);
-    out += ",\"number\":";
-    out += std::to_string(issue.number);
-    out += ",\"title\":";
+    auto append_dec = [&](uint64_t v) {
+        char tmp[24];
+        char* p = tmp + sizeof(tmp);
+        do {
+            *--p = static_cast<char>('0' + (v % 10));
+            v /= 10;
+        } while (v != 0);
+        out.append(p, static_cast<size_t>((tmp + sizeof(tmp)) - p));
+    };
+    out.append("{\"id\":", 6);
+    append_dec(issue.db_id);
+    out.append(",\"number\":", 10);
+    append_dec(issue.number);
+    out.append(",\"title\":", 9);
     append_json_escaped(out, issue.title);
-    out += ",\"body\":";
+    out.append(",\"body\":", 8);
     append_json_escaped(out, issue.body);
-    out += ",\"state\":";
-    out += issue.closed ? "\"closed\"" : "\"open\"";
-    out += ",\"labels\":[";
+    out.append(",\"state\":", 9);
+    if (issue.closed) out.append("\"closed\"", 8);
+    else out.append("\"open\"", 6);
+    out.append(",\"labels\":[", 11);
     for (size_t i = 0; i < issue.labels.size(); ++i) {
         if (i > 0) out.push_back(',');
         auto it = repo.labels.find(issue.labels[i]);
-        out += "{\"name\":";
+        out.append("{\"name\":", 8);
         append_json_escaped(out, issue.labels[i]);
-        out += ",\"color\":";
+        out.append(",\"color\":", 9);
         append_json_escaped(out, it != repo.labels.end() ? it->second.color : std::string("ededed"));
-        out += "}";
+        out.push_back('}');
     }
-    out += "]}";
+    out.append("]}", 2);
 }
 
 void ForgeStore::append_pull_json(const Repo& repo, const PullRequest& pr, std::string& out) {

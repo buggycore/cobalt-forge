@@ -326,39 +326,76 @@ void handle_info_refs(ForgeStore& store, Repo& repo, const HttpRequest& req, Htt
 
     if (service == "git-receive-pack") {
         static constexpr std::string_view kCaps = "report-status side-band-64k delete-refs ofs-delta";
+        // Zero-allocation fast path for 0 or 1 ref (the push benchmark hot path!)
+        if (repo.refs.size() <= 1) {
+            char buf[512];
+            size_t n = 0;
+            auto put_pkt = [&](const char* p, size_t plen) {
+                static constexpr char kHex[] = "0123456789abcdef";
+                size_t total = plen + 4;
+                buf[n++] = kHex[(total >> 12) & 0xf];
+                buf[n++] = kHex[(total >> 8) & 0xf];
+                buf[n++] = kHex[(total >> 4) & 0xf];
+                buf[n++] = kHex[total & 0xf];
+                std::memcpy(buf + n, p, plen);
+                n += plen;
+            };
+            put_pkt("# service=git-receive-pack\n", 27);
+            std::memcpy(buf + n, "0000", 4);
+            n += 4;
+            char line[256];
+            size_t ln = 0;
+            if (repo.refs.empty()) {
+                std::memset(line, '0', 40);
+                std::memcpy(line + 40, " capabilities^{}\0", 17);
+                std::memcpy(line + 57, kCaps.data(), kCaps.size());
+                line[57 + kCaps.size()] = '\n';
+                ln = 58 + kCaps.size();
+            } else {
+                const auto& [name, oid] = *repo.refs.begin();
+                if (40 + 1 + name.size() + 1 + kCaps.size() + 1 <= sizeof(line)) {
+                    oid.write_hex(line);
+                    line[40] = ' ';
+                    std::memcpy(line + 41, name.data(), name.size());
+                    ln = 41 + name.size();
+                    line[ln++] = '\0';
+                    std::memcpy(line + ln, kCaps.data(), kCaps.size());
+                    ln += kCaps.size();
+                    line[ln++] = '\n';
+                }
+            }
+            if (ln > 0) {
+                put_pkt(line, ln);
+                std::memcpy(buf + n, "0000", 4);
+                n += 4;
+                build_git_http_response(res, "application/x-git-receive-pack-advertisement", std::string_view(buf, n), req.keep_alive);
+                return;
+            }
+        }
         std::string body;
         body.reserve(160 + repo.refs.size() * 72);
         append_pkt(body, "# service=git-receive-pack\n");
         body.append("0000");
-        if (repo.refs.empty()) {
-            char line[160];
-            std::memset(line, '0', 40);
-            std::memcpy(line + 40, " capabilities^{}\0", 17);
-            std::memcpy(line + 57, kCaps.data(), kCaps.size());
-            line[57 + kCaps.size()] = '\n';
-            append_pkt(body, std::string_view(line, 58 + kCaps.size()));
-        } else {
-            bool first = true;
-            char hex40[40];
-            std::string line;
-            line.reserve(160);
-            for (const auto& [name, oid] : repo.refs) {
-                line.clear();
-                oid.write_hex(hex40);
-                line.append(hex40, 40);
-                line.push_back(' ');
-                line.append(name);
-                if (first) {
-                    line.push_back('\0');
-                    line.append(kCaps);
-                    first = false;
-                }
-                line.push_back('\n');
-                append_pkt(body, line);
+        bool first = true;
+        char hex40[40];
+        std::string line;
+        line.reserve(160);
+        for (const auto& [name, oid] : repo.refs) {
+            line.clear();
+            oid.write_hex(hex40);
+            line.append(hex40, 40);
+            line.push_back(' ');
+            line.append(name);
+            if (first) {
+                line.push_back('\0');
+                line.append(kCaps);
+                first = false;
             }
+            line.push_back('\n');
+            append_pkt(body, line);
         }
         body.append("0000");
-        build_http_response(res, 200, "application/x-git-receive-pack-advertisement", body, store.next_request_id(), req.keep_alive);
+        build_git_http_response(res, "application/x-git-receive-pack-advertisement", body, req.keep_alive);
         return;
     }
 
@@ -454,7 +491,7 @@ void handle_upload_pack(ForgeStore& store, Repo& repo, const HttpRequest& req, H
                 append_pkt(body, line);
             }
             body.append("0000");
-            build_http_response(res, 200, "application/x-git-upload-pack-result", body, store.next_request_id(), req.keep_alive);
+            build_git_http_response(res, "application/x-git-upload-pack-result", body, req.keep_alive);
             if (req.keep_alive && is_default_query) {
                 repo.cached_ls_refs_http = res.owned_raw;
                 repo.cached_ls_refs_version = repo.ref_version;
@@ -502,7 +539,7 @@ void handle_upload_pack(ForgeStore& store, Repo& repo, const HttpRequest& req, H
             append_pkt_sideband(body, 1, pack.data(), pack.size());
             body.append("0000");
 
-            build_http_response(res, 200, "application/x-git-upload-pack-result", body, store.next_request_id(), req.keep_alive);
+            build_git_http_response(res, "application/x-git-upload-pack-result", body, req.keep_alive);
             if (cacheable_shallow1) {
                 repo.shallow1_http_cache.emplace(wants[0], res.owned_raw);
             }
@@ -553,6 +590,128 @@ struct PushCmd {
 };
 
 void handle_receive_pack(ForgeStore& store, Repo& repo, const HttpRequest& req, HttpResponse& res) {
+    // Zero-allocation fast path for single-ref push: <4hex><old> <new> <ref>\0<caps>\n 0000 PACK...
+    if (req.body.size() >= 96) {
+        unsigned len0 = 0;
+        bool ok_hex = true;
+        for (int i = 0; i < 4; ++i) {
+            int n = hex_nibble(req.body[i]);
+            if (n < 0) { ok_hex = false; break; }
+            len0 = (len0 << 4) | static_cast<unsigned>(n);
+        }
+        if (ok_hex && len0 >= 87 && len0 + 4 <= req.body.size() &&
+            std::memcmp(req.body.data() + len0, "0000", 4) == 0) {
+            std::string_view line = strip_nl(req.body.substr(4, len0 - 4));
+            bool use_sideband = false;
+            size_t nul = line.find('\0');
+            if (nul != std::string_view::npos) {
+                std::string_view caps = line.substr(nul + 1);
+                if (caps.find("side-band-64k") != std::string_view::npos) use_sideband = true;
+                line = line.substr(0, nul);
+            }
+            Oid old_oid{}, new_oid{};
+            if (line.size() >= 83 && line[40] == ' ' && line[81] == ' ' &&
+                parse_oid(line.substr(0, 40), old_oid) && parse_oid(line.substr(41, 40), new_oid)) {
+                std::string_view ref = line.substr(82);
+                std::string_view pack_view = req.body.substr(len0 + 4);
+                bool unpack_ok = true;
+                std::string unpack_err;
+                if (!pack_view.empty()) {
+                    unpack_ok = store.unpack_pack(
+                        repo,
+                        reinterpret_cast<const uint8_t*>(pack_view.data()),
+                        pack_view.size(),
+                        unpack_err);
+                }
+
+                auto emit_single_report = [&](std::string_view status_line_sv) {
+                    char rep[320];
+                    size_t rn = 0;
+                    auto put_pkt = [&](char* dst, size_t& off, const char* p, size_t plen) {
+                        static constexpr char kHex[] = "0123456789abcdef";
+                        size_t tot = plen + 4;
+                        dst[off++] = kHex[(tot >> 12) & 0xf];
+                        dst[off++] = kHex[(tot >> 8) & 0xf];
+                        dst[off++] = kHex[(tot >> 4) & 0xf];
+                        dst[off++] = kHex[tot & 0xf];
+                        std::memcpy(dst + off, p, plen);
+                        off += plen;
+                    };
+                    if (unpack_ok) {
+                        put_pkt(rep, rn, "unpack ok\n", 10);
+                    } else {
+                        std::string u = "unpack " + unpack_err + "\n";
+                        put_pkt(rep, rn, u.data(), u.size());
+                    }
+                    put_pkt(rep, rn, status_line_sv.data(), status_line_sv.size());
+                    std::memcpy(rep + rn, "0000", 4);
+                    rn += 4;
+
+                    if (use_sideband) {
+                        char sb[360];
+                        size_t sn = 0;
+                        static constexpr char kHex[] = "0123456789abcdef";
+                        size_t tot = rn + 5;
+                        sb[sn++] = kHex[(tot >> 12) & 0xf];
+                        sb[sn++] = kHex[(tot >> 8) & 0xf];
+                        sb[sn++] = kHex[(tot >> 4) & 0xf];
+                        sb[sn++] = kHex[tot & 0xf];
+                        sb[sn++] = '\x01';
+                        std::memcpy(sb + sn, rep, rn);
+                        sn += rn;
+                        std::memcpy(sb + sn, "0000", 4);
+                        sn += 4;
+                        build_git_http_response(res, "application/x-git-receive-pack-result", std::string_view(sb, sn), req.keep_alive);
+                    } else {
+                        build_git_http_response(res, "application/x-git-receive-pack-result", std::string_view(rep, rn), req.keep_alive);
+                    }
+                };
+
+                if (ref.size() <= 200) {
+                    char status_buf[256];
+                    size_t slen = 0;
+                    bool ok_ref = false;
+                    const char* ng_reason = nullptr;
+                    if (unpack_ok) {
+                        auto rit = repo.refs.find(ref);
+                        bool exists = (rit != repo.refs.end());
+                        Oid current = exists ? rit->second : Oid{};
+                        if (new_oid.is_zero()) {
+                            if (!exists || (!old_oid.is_zero() && current != old_oid)) ng_reason = " non-fast-forward\n";
+                            else { repo.refs.erase(rit); ok_ref = true; }
+                        } else if (old_oid.is_zero()) {
+                            if (exists) ng_reason = " non-fast-forward\n";
+                            else if (repo.objects.find(new_oid) == repo.objects.end()) ng_reason = " missing object\n";
+                            else { repo.refs.emplace(std::string(ref), new_oid); ok_ref = true; }
+                        } else {
+                            if (!exists || current != old_oid) ng_reason = " non-fast-forward\n";
+                            else if (repo.objects.find(new_oid) == repo.objects.end()) ng_reason = " missing object\n";
+                            else if (!store.is_ancestor(repo, old_oid, new_oid)) ng_reason = " non-fast-forward\n";
+                            else { rit->second = new_oid; ok_ref = true; }
+                        }
+                    } else {
+                        ng_reason = " unpack failed\n";
+                    }
+                    if (ok_ref) {
+                        repo.ref_version++;
+                        std::memcpy(status_buf, "ok ", 3);
+                        std::memcpy(status_buf + 3, ref.data(), ref.size());
+                        status_buf[3 + ref.size()] = '\n';
+                        slen = 4 + ref.size();
+                    } else {
+                        std::memcpy(status_buf, "ng ", 3);
+                        std::memcpy(status_buf + 3, ref.data(), ref.size());
+                        size_t rlen = std::strlen(ng_reason);
+                        std::memcpy(status_buf + 3 + ref.size(), ng_reason, rlen);
+                        slen = 3 + ref.size() + rlen;
+                    }
+                    emit_single_report(std::string_view(status_buf, slen));
+                    return;
+                }
+            }
+        }
+    }
+
     std::vector<PktLine> pkts;
     size_t consumed = 0;
     if (!parse_pkt_lines(req.body, pkts, consumed, true)) {

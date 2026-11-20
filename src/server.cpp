@@ -5,13 +5,13 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
-#include <memory>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <string>
 #include <string_view>
 #include <sys/epoll.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 #include <vector>
 
@@ -48,14 +48,118 @@ inline std::string_view trim_ows(std::string_view s) noexcept {
     return s;
 }
 
+// Raw IPv4 HTTP/1.1 client for --env-mode (/register and idle-only /done). Zero glibc NSS DNS calls.
+bool env_http_exchange(
+    const char* ip, uint16_t port, const std::string& req_bytes, int& out_status, std::string& out_body) {
+    out_status = 0;
+    out_body.clear();
+    int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return false;
+
+    timeval tv{};
+    tv.tv_sec = 5;
+    tv.tv_usec = 0;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    if (inet_pton(AF_INET, ip, &addr.sin_addr) != 1) {
+        close(fd);
+        return false;
+    }
+    if (connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+        close(fd);
+        return false;
+    }
+
+    size_t sent = 0;
+    while (sent < req_bytes.size()) {
+        ssize_t n = send(fd, req_bytes.data() + sent, req_bytes.size() - sent, MSG_NOSIGNAL);
+        if (n <= 0) {
+            close(fd);
+            return false;
+        }
+        sent += static_cast<size_t>(n);
+    }
+
+    std::string resp;
+    char buf[4096];
+    for (;;) {
+        ssize_t n = recv(fd, buf, sizeof(buf), 0);
+        if (n > 0) {
+            resp.append(buf, static_cast<size_t>(n));
+            if (resp.size() > 65536) break;
+        } else {
+            break;
+        }
+    }
+    close(fd);
+
+    size_t sp1 = resp.find(' ');
+    if (sp1 == std::string::npos || sp1 + 4 > resp.size()) return false;
+    out_status = std::atoi(resp.c_str() + sp1 + 1);
+    size_t hdr_end = resp.find("\r\n\r\n");
+    if (hdr_end != std::string::npos) {
+        out_body = resp.substr(hdr_end + 4);
+    }
+    return out_status > 0;
+}
+
+bool register_with_env(
+    const char* ip, uint16_t env_port, const char* host_hdr, const char* prefix, uint16_t forge_port) {
+    std::string body = "{\"port\":" + std::to_string(forge_port) + "}";
+    std::string req =
+        "POST " + std::string(prefix) + "/register HTTP/1.1\r\n"
+        "Host: " + std::string(host_hdr) + "\r\n"
+        "Content-Type: application/json\r\n"
+        "Connection: close\r\n"
+        "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+
+    int delay_ms = 50;
+    for (int attempt = 0; attempt < 60 && !g_stop; ++attempt) {
+        int status = 0;
+        std::string resp_body;
+        if (env_http_exchange(ip, env_port, req, status, resp_body)) {
+            if (status == 200 || status == 409) return true;
+            if (status == 400 || status == 405) return false;
+        }
+        usleep(static_cast<useconds_t>(delay_ms) * 1000u);
+        if (delay_ms < 1000) delay_ms *= 2;
+    }
+    return false;
+}
+
+bool poll_env_done(const char* ip, uint16_t env_port, const std::string& done_req) {
+    int status = 0;
+    std::string resp_body;
+    if (!env_http_exchange(ip, env_port, done_req, status, resp_body)) return false;
+    if (status != 200) return false;
+    return resp_body.find("\"done\":true") != std::string::npos ||
+           resp_body.find("\"done\": true") != std::string::npos;
+}
+
 struct Conn {
     int fd = -1;
+    bool active = false;
     std::string rbuf;
     size_t rpos = 0;
     std::string wbuf;
     size_t wpos = 0;
     bool close_after_write = false;
     bool epoll_out = false;
+
+    void reset() noexcept {
+        fd = -1;
+        active = false;
+        rbuf.clear();
+        rpos = 0;
+        wbuf.clear();
+        wpos = 0;
+        close_after_write = false;
+        epoll_out = false;
+    }
 };
 
 enum class ParseStatus : uint8_t { Incomplete, Complete, Error };
@@ -263,9 +367,12 @@ int main(int argc, char** argv) {
     std::signal(SIGINT, on_signal);
 
     uint16_t bind_port = 0;
+    bool env_mode = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
             bind_port = static_cast<uint16_t>(std::atoi(argv[++i]));
+        } else if (std::strcmp(argv[i], "--env-mode") == 0) {
+            env_mode = true;
         }
     }
 
@@ -310,8 +417,35 @@ int main(int argc, char** argv) {
         return 1;
     }
     uint16_t actual_port = ntohs(addr.sin_port);
-    std::printf("PORT %u\n", static_cast<unsigned>(actual_port));
-    std::fflush(stdout);
+
+    const char* env_ip = std::getenv("MAKEFUN_ENV_IP");
+    const char* env_port_s = std::getenv("MAKEFUN_ENV_PORT");
+    const char* env_host = std::getenv("MAKEFUN_ENV_HOST");
+    const char* env_prefix = std::getenv("MAKEFUN_ENV_PREFIX");
+    uint16_t env_port = (env_port_s && *env_port_s) ? static_cast<uint16_t>(std::atoi(env_port_s)) : 0;
+    std::string done_req;
+
+    if (env_mode) {
+        if (!env_ip || !*env_ip || env_port == 0) {
+            std::fprintf(stderr, "[cobalt-forge] missing MAKEFUN_ENV_IP/PORT in --env-mode\n");
+            close(listen_fd);
+            return 1;
+        }
+        const char* host_h = (env_host && *env_host) ? env_host : env_ip;
+        const char* pref = env_prefix ? env_prefix : "";
+        if (!register_with_env(env_ip, env_port, host_h, pref, actual_port)) {
+            std::fprintf(stderr, "[cobalt-forge] failed to register port %u with env\n", static_cast<unsigned>(actual_port));
+            close(listen_fd);
+            return 1;
+        }
+        done_req =
+            "GET " + std::string(pref) + "/done HTTP/1.1\r\n"
+            "Host: " + std::string(host_h) + "\r\n"
+            "Connection: close\r\n\r\n";
+    } else {
+        std::printf("PORT %u\n", static_cast<unsigned>(actual_port));
+        std::fflush(stdout);
+    }
 
     int epfd = epoll_create1(EPOLL_CLOEXEC);
     if (epfd < 0) {
@@ -330,7 +464,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    std::vector<std::unique_ptr<Conn>> conns(512);
+    std::vector<Conn> conns(512);
 
     auto close_conn = [&](int fd) {
         epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
@@ -397,10 +531,17 @@ int main(int argc, char** argv) {
     res.owned_raw.reserve(8192);
 
     while (!g_stop) {
-        int nfds = epoll_wait(epfd, events.data(), static_cast<int>(events.size()), 250);
+        int nfds = epoll_wait(epfd, events.data(), static_cast<int>(events.size()), 200);
         if (nfds < 0) {
             if (errno == EINTR) continue;
             break;
+        }
+        if (nfds == 0) {
+            // Only poll /done when completely idle for >= 200ms (never interrupts active benchmarks!)
+            if (env_mode && poll_env_done(env_ip, env_port, done_req)) {
+                break;
+            }
+            continue;
         }
 
         for (int i = 0; i < nfds; ++i) {
@@ -425,18 +566,19 @@ int main(int argc, char** argv) {
                         close(cfd);
                         continue;
                     }
-                    auto conn = std::make_unique<Conn>();
-                    conn->fd = cfd;
                     if (static_cast<size_t>(cfd) >= conns.size()) {
                         conns.resize(static_cast<size_t>(cfd) + 64);
                     }
-                    conns[static_cast<size_t>(cfd)] = std::move(conn);
+                    Conn& nc = conns[static_cast<size_t>(cfd)];
+                    nc.reset();
+                    nc.fd = cfd;
+                    nc.active = true;
                 }
                 continue;
             }
 
-            if (fd < 0 || static_cast<size_t>(fd) >= conns.size() || !conns[static_cast<size_t>(fd)]) continue;
-            Conn& c = *conns[static_cast<size_t>(fd)];
+            if (fd < 0 || static_cast<size_t>(fd) >= conns.size() || !conns[static_cast<size_t>(fd)].active) continue;
+            Conn& c = conns[static_cast<size_t>(fd)];
 
             if (ev & (EPOLLERR | EPOLLHUP)) {
                 close_conn(fd);
@@ -451,7 +593,7 @@ int main(int argc, char** argv) {
             }
 
             if (ev & EPOLLIN) {
-                // Fast zero-copy path: when no partial request is buffered on `c`, read straight into L1-hot fast_buf
+                // Fast zero-copy path: read straight into L1-hot fast_buf when no partial request is buffered
                 if (c.rbuf.empty()) {
                     ssize_t n = recv(fd, fast_buf, sizeof(fast_buf), 0);
                     if (n > 0) {
@@ -561,8 +703,8 @@ int main(int argc, char** argv) {
         }
     }
 
-    for (auto& cp : conns) {
-        if (cp) close(cp->fd);
+    for (auto& c : conns) {
+        if (c.active) close(c.fd);
     }
     close(epfd);
     close(listen_fd);

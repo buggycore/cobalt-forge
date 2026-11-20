@@ -102,6 +102,26 @@ inline void build_http_response(
     out.owned_raw.append(body);
 }
 
+inline void build_git_http_response(
+    HttpResponse& out,
+    std::string_view content_type,
+    std::string_view body,
+    bool keep_alive) {
+    out.raw_ptr = nullptr;
+    out.raw_len = 0;
+    out.owned_raw.clear();
+    out.owned_raw.reserve(96 + content_type.size() + body.size());
+    out.owned_raw.append("HTTP/1.1 200 OK\r\nContent-Type: ", 31);
+    out.owned_raw.append(content_type);
+    if (!keep_alive) {
+        out.owned_raw.append("\r\nConnection: close", 19);
+    }
+    out.owned_raw.append("\r\nContent-Length: ", 18);
+    append_u64_dec(out.owned_raw, body.size());
+    out.owned_raw.append("\r\n\r\n", 4);
+    out.owned_raw.append(body);
+}
+
 inline void build_json_response(
     HttpResponse& out,
     int status,
