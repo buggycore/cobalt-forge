@@ -832,6 +832,10 @@ void handle_receive_pack(ForgeStore& store, Repo& repo, const HttpRequest& req, 
 
 } // namespace
 
+const std::string& git_v2_info_refs_http() noexcept {
+    return static_v2_info_refs_http();
+}
+
 bool try_git_fast_readonly(const ForgeStore& store, const HttpRequest& req, HttpResponse& res) {
     if (!req.keep_alive) return false;
     std::string_view p = req.path;

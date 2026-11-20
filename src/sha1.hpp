@@ -152,31 +152,50 @@ private:
     void compress(const uint8_t block[64]) noexcept {
         uint32_t w[80];
         for (int i = 0; i < 16; ++i) {
-            w[i] = (static_cast<uint32_t>(block[4 * i + 0]) << 24) |
-                   (static_cast<uint32_t>(block[4 * i + 1]) << 16) |
-                   (static_cast<uint32_t>(block[4 * i + 2]) << 8) |
-                   static_cast<uint32_t>(block[4 * i + 3]);
+            uint32_t v;
+            std::memcpy(&v, block + 4 * i, 4);
+            w[i] = __builtin_bswap32(v);
         }
         for (int i = 16; i < 80; ++i) {
             w[i] = rol32(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
         }
         uint32_t a = h_[0], b = h_[1], c = h_[2], d = h_[3], e = h_[4];
-        for (int i = 0; i < 20; ++i) {
-            uint32_t t = rol32(a, 5) + ((b & c) | ((~b) & d)) + e + 0x5a827999u + w[i];
-            e = d; d = c; c = rol32(b, 30); b = a; a = t;
+#define SHA1_R0(v, w_, x, y, z, i) z += ((w_ & (x ^ y)) ^ y) + w[i] + 0x5a827999u + rol32(v, 5); w_ = rol32(w_, 30)
+#define SHA1_R1(v, w_, x, y, z, i) z += (w_ ^ x ^ y) + w[i] + 0x6ed9eba1u + rol32(v, 5); w_ = rol32(w_, 30)
+#define SHA1_R2(v, w_, x, y, z, i) z += (((w_ | x) & y) | (w_ & x)) + w[i] + 0x8f1bbcdcu + rol32(v, 5); w_ = rol32(w_, 30)
+#define SHA1_R3(v, w_, x, y, z, i) z += (w_ ^ x ^ y) + w[i] + 0xca62c1d6u + rol32(v, 5); w_ = rol32(w_, 30)
+        for (int i = 0; i < 20; i += 5) {
+            SHA1_R0(a, b, c, d, e, i + 0);
+            SHA1_R0(e, a, b, c, d, i + 1);
+            SHA1_R0(d, e, a, b, c, i + 2);
+            SHA1_R0(c, d, e, a, b, i + 3);
+            SHA1_R0(b, c, d, e, a, i + 4);
         }
-        for (int i = 20; i < 40; ++i) {
-            uint32_t t = rol32(a, 5) + (b ^ c ^ d) + e + 0x6ed9eba1u + w[i];
-            e = d; d = c; c = rol32(b, 30); b = a; a = t;
+        for (int i = 20; i < 40; i += 5) {
+            SHA1_R1(a, b, c, d, e, i + 0);
+            SHA1_R1(e, a, b, c, d, i + 1);
+            SHA1_R1(d, e, a, b, c, i + 2);
+            SHA1_R1(c, d, e, a, b, i + 3);
+            SHA1_R1(b, c, d, e, a, i + 4);
         }
-        for (int i = 40; i < 60; ++i) {
-            uint32_t t = rol32(a, 5) + ((b & c) | (b & d) | (c & d)) + e + 0x8f1bbcdcu + w[i];
-            e = d; d = c; c = rol32(b, 30); b = a; a = t;
+        for (int i = 40; i < 60; i += 5) {
+            SHA1_R2(a, b, c, d, e, i + 0);
+            SHA1_R2(e, a, b, c, d, i + 1);
+            SHA1_R2(d, e, a, b, c, i + 2);
+            SHA1_R2(c, d, e, a, b, i + 3);
+            SHA1_R2(b, c, d, e, a, i + 4);
         }
-        for (int i = 60; i < 80; ++i) {
-            uint32_t t = rol32(a, 5) + (b ^ c ^ d) + e + 0xca62c1d6u + w[i];
-            e = d; d = c; c = rol32(b, 30); b = a; a = t;
+        for (int i = 60; i < 80; i += 5) {
+            SHA1_R3(a, b, c, d, e, i + 0);
+            SHA1_R3(e, a, b, c, d, i + 1);
+            SHA1_R3(d, e, a, b, c, i + 2);
+            SHA1_R3(c, d, e, a, b, i + 3);
+            SHA1_R3(b, c, d, e, a, i + 4);
         }
+#undef SHA1_R0
+#undef SHA1_R1
+#undef SHA1_R2
+#undef SHA1_R3
         h_[0] += a;
         h_[1] += b;
         h_[2] += c;
