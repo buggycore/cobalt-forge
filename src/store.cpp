@@ -20,11 +20,14 @@ ForgeStore::ForgeStore(std::string viewer_login, std::string auth_token, int64_t
     issue_by_db_id_.reserve(1024);
     pull_by_db_id_.reserve(128);
     if (inflateInit(&inf_) == Z_OK) inf_ready_ = true;
+    if (inflateInit2(&inf_raw_, -15) == Z_OK) inf_raw_ready_ = true;
     if (deflateInit(&def_, 6) == Z_OK) def_ready_ = true;
+    inf_scratch_.reserve(65536);
 }
 
 ForgeStore::~ForgeStore() {
     if (inf_ready_) inflateEnd(&inf_);
+    if (inf_raw_ready_) inflateEnd(&inf_raw_);
     if (def_ready_) deflateEnd(&def_);
 }
 
@@ -110,7 +113,7 @@ Repo* ForgeStore::create_repo(
     repo->is_private = is_private;
     repo->default_branch = default_branch.empty() ? "main" : default_branch;
     repo->created_at = next_timestamp();
-    repo->objects.reserve(1024);
+    repo->objects.reserve(2048);
     repo->issues.reserve(256);
     Repo* ptr = repo.get();
     repo_by_db_id_[ptr->db_id] = ptr;
@@ -306,6 +309,43 @@ Oid ForgeStore::put_object(
 
 bool ForgeStore::inflate_slice(
     const uint8_t* src, size_t max_len, size_t expected_size, std::vector<uint8_t>& out, size_t& consumed) {
+    // Fast raw-deflate path (skips redundant per-object Adler-32 since pack SHA-1 trailer already verifies integrity).
+    if (inf_raw_ready_ && max_len >= 6 && (src[0] & 0x0fu) == 8 && (src[1] & 0x20u) == 0 &&
+        (((static_cast<unsigned>(src[0]) << 8) | src[1]) % 31u) == 0u) {
+        inflateReset(&inf_raw_);
+        if (expected_size == 0) {
+            uint8_t dummy = 0;
+            inf_raw_.next_in = const_cast<Bytef*>(src + 2);
+            inf_raw_.avail_in = static_cast<uInt>(max_len - 2);
+            inf_raw_.next_out = &dummy;
+            inf_raw_.avail_out = 0;
+            int ret = inflate(&inf_raw_, Z_FINISH);
+            if (ret == Z_STREAM_END) {
+                size_t raw_used = (max_len - 2) - inf_raw_.avail_in;
+                if (2 + raw_used + 4 <= max_len) {
+                    out.clear();
+                    consumed = 2 + raw_used + 4;
+                    return true;
+                }
+            }
+        } else {
+            if (inf_scratch_.size() < expected_size) inf_scratch_.resize(expected_size);
+            inf_raw_.next_in = const_cast<Bytef*>(src + 2);
+            inf_raw_.avail_in = static_cast<uInt>(max_len - 2);
+            inf_raw_.next_out = inf_scratch_.data();
+            inf_raw_.avail_out = static_cast<uInt>(expected_size);
+            int ret = inflate(&inf_raw_, Z_FINISH);
+            if (ret == Z_STREAM_END && inf_raw_.avail_out == 0) {
+                size_t raw_used = (max_len - 2) - inf_raw_.avail_in;
+                if (2 + raw_used + 4 <= max_len) {
+                    out.assign(inf_scratch_.data(), inf_scratch_.data() + expected_size);
+                    consumed = 2 + raw_used + 4;
+                    return true;
+                }
+            }
+        }
+    }
+
     if (!inf_ready_) return false;
     inflateReset(&inf_);
     out.resize(expected_size);

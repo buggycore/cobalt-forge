@@ -197,34 +197,40 @@ ParseStatus try_parse_request(const char* data, size_t start, size_t end, Parsed
 
     size_t pos = line_end + 2;
     while (pos < hdr_end) {
-        size_t eol = view.find("\r\n", pos);
-        if (eol == std::string_view::npos || eol > hdr_end) eol = hdr_end;
-        std::string_view line = view.substr(pos, eol - pos);
-        pos = eol + 2;
-        size_t colon = line.find(':');
-        if (colon == std::string_view::npos) continue;
+        const char* lf = static_cast<const char*>(std::memchr(view.data() + pos, '\n', hdr_end - pos));
+        size_t eol = lf ? static_cast<size_t>(lf - view.data()) : hdr_end;
+        size_t line_end_trim = (eol > pos && view[eol - 1] == '\r') ? (eol - 1) : eol;
+        std::string_view line = view.substr(pos, line_end_trim - pos);
+        pos = (eol < hdr_end) ? (eol + 1) : hdr_end;
+        if (line.empty()) continue;
+        unsigned char c0 = static_cast<unsigned char>(line[0]);
+        if (c0 >= 'A' && c0 <= 'Z') c0 += 32;
+        if (c0 != 'a' && c0 != 'c' && c0 != 'g' && c0 != 'h' && c0 != 'm' && c0 != 't') continue;
+        const char* col_p = static_cast<const char*>(std::memchr(line.data(), ':', line.size()));
+        if (!col_p) continue;
+        size_t colon = static_cast<size_t>(col_p - line.data());
         std::string_view k = line.substr(0, colon);
         std::string_view v = trim_ows(line.substr(colon + 1));
 
         switch (k.size()) {
             case 4:
-                if (iequals(k, "host")) out.req.host = v;
+                if (c0 == 'h' && iequals(k, "host")) out.req.host = v;
                 break;
             case 10:
-                if (iequals(k, "connection")) {
+                if (c0 == 'c' && iequals(k, "connection")) {
                     if (iequals(v, "close")) out.req.keep_alive = false;
                     else if (iequals(v, "keep-alive")) out.req.keep_alive = true;
                 }
                 break;
             case 12:
-                if (iequals(k, "content-type")) out.req.content_type = v;
-                else if (iequals(k, "git-protocol")) out.req.git_protocol = v;
+                if (c0 == 'c' && iequals(k, "content-type")) out.req.content_type = v;
+                else if (c0 == 'g' && iequals(k, "git-protocol")) out.req.git_protocol = v;
                 break;
             case 13:
-                if (iequals(k, "authorization")) out.req.authorization = v;
+                if (c0 == 'a' && iequals(k, "authorization")) out.req.authorization = v;
                 break;
             case 14:
-                if (iequals(k, "content-length")) {
+                if (c0 == 'c' && iequals(k, "content-length")) {
                     size_t cl = 0;
                     for (char c : v) {
                         if (c < '0' || c > '9') return ParseStatus::Error;
@@ -233,19 +239,19 @@ ParseStatus try_parse_request(const char* data, size_t start, size_t end, Parsed
                     }
                     content_length = cl;
                     has_cl = true;
-                } else if (iequals(k, "mcp-session-id")) {
+                } else if (c0 == 'm' && iequals(k, "mcp-session-id")) {
                     out.req.mcp_session_id = v;
                 }
                 break;
             case 17:
-                if (iequals(k, "transfer-encoding")) {
+                if (c0 == 't' && iequals(k, "transfer-encoding")) {
                     if (v.find("chunked") != std::string_view::npos || v.find("Chunked") != std::string_view::npos) {
                         chunked = true;
                     }
                 }
                 break;
             case 20:
-                if (iequals(k, "mcp-protocol-version")) out.req.mcp_protocol_version = v;
+                if (c0 == 'm' && iequals(k, "mcp-protocol-version")) out.req.mcp_protocol_version = v;
                 break;
             default:
                 break;
@@ -641,7 +647,7 @@ void handle_connection(int fd, ServerCtx& ctx, std::string& rbuf, ParsedReq& par
 
 void* worker_entry(void* arg) {
     auto* ctx = static_cast<ServerCtx*>(arg);
-    std::string rbuf(65536, '\0');
+    std::string rbuf(16384, '\0');
     ParsedReq parsed;
     forge::HttpResponse res;
     res.owned_raw.reserve(4096);
@@ -658,8 +664,8 @@ void* worker_entry(void* arg) {
         }
         handle_connection(fd, *ctx, rbuf, parsed, res);
         close(fd);
-        if (rbuf.size() > 262144) {
-            std::string shrunk(65536, '\0');
+        if (rbuf.size() > 65536) {
+            std::string shrunk(16384, '\0');
             rbuf.swap(shrunk);
         }
     }
@@ -670,7 +676,7 @@ void spawn_worker(ServerCtx* ctx) {
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-    pthread_attr_setstacksize(&attr, 192 * 1024);
+    pthread_attr_setstacksize(&attr, 128 * 1024);
     pthread_t tid{};
     pthread_create(&tid, &attr, worker_entry, ctx);
     pthread_attr_destroy(&attr);
@@ -710,15 +716,15 @@ int main(int argc, char** argv) {
     ctx.store = &store;
     ctx.fd_queue.reserve(128);
 
-    // Start lean (4 workers) and grow on demand up to 180 during concurrent clone bursts
-    constexpr size_t kInitialWorkers = 4;
-    constexpr size_t kMaxWorkers = 180;
+    // Pre-warm 64 workers BEFORE /register so concurrent clone bursts incur zero pthread_create latency
+    constexpr size_t kInitialWorkers = 64;
+    constexpr size_t kMaxWorkers = 200;
     ctx.total_workers = kInitialWorkers;
     for (size_t i = 0; i < kInitialWorkers; ++i) {
         spawn_worker(&ctx);
     }
 
-    int listen_fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    int listen_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (listen_fd < 0) {
         std::perror("socket");
         return 1;
@@ -780,44 +786,45 @@ int main(int argc, char** argv) {
     }
 
     while (!g_stop) {
-        if (env_mode) {
-            pollfd pfd{};
-            pfd.fd = listen_fd;
-            pfd.events = POLLIN;
-            int pr = poll(&pfd, 1, 1500);
-            if (pr == 0) {
-                if (poll_env_done(env_ip, env_port, done_req)) break;
-                continue;
-            }
-            if (pr < 0) {
+        pollfd pfd{};
+        pfd.fd = listen_fd;
+        pfd.events = POLLIN;
+        int pr = poll(&pfd, 1, env_mode ? 1500 : 250);
+        if (pr == 0) {
+            if (env_mode && poll_env_done(env_ip, env_port, done_req)) break;
+            continue;
+        }
+        if (pr < 0) {
+            if (errno == EINTR && !g_stop) continue;
+            break;
+        }
+
+        // Batch-drain all pending connections in a single poll wakeup (huge win for 50-way clone!)
+        size_t accepted = 0;
+        for (;;) {
+            sockaddr_in caddr{};
+            socklen_t clen = sizeof(caddr);
+            // SOCK_CLOEXEC without SOCK_NONBLOCK gives a blocking client fd!
+            int cfd = accept4(listen_fd, reinterpret_cast<sockaddr*>(&caddr), &clen, SOCK_CLOEXEC);
+            if (cfd < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) break;
                 if (errno == EINTR && !g_stop) continue;
                 break;
             }
-        }
-        sockaddr_in caddr{};
-        socklen_t clen = sizeof(caddr);
-        int cfd = accept4(listen_fd, reinterpret_cast<sockaddr*>(&caddr), &clen, SOCK_CLOEXEC);
-        if (cfd < 0) {
-            if (errno == EINTR && !g_stop) continue;
-            if (g_stop) break;
-            continue;
-        }
-        int nodelay = 1;
-        setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
-        timeval ctv{};
-        ctv.tv_sec = 2;
-        ctv.tv_usec = 0;
-        setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &ctv, sizeof(ctv));
-
-        {
-            std::lock_guard<std::mutex> lk(ctx.pool_mu);
-            ctx.fd_queue.push_back(cfd);
-            if (ctx.fd_queue.size() > ctx.idle_workers && ctx.total_workers < kMaxWorkers) {
-                ++ctx.total_workers;
-                spawn_worker(&ctx);
+            int nodelay = 1;
+            setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+            {
+                std::lock_guard<std::mutex> lk(ctx.pool_mu);
+                ctx.fd_queue.push_back(cfd);
+                if (ctx.fd_queue.size() > ctx.idle_workers && ctx.total_workers < kMaxWorkers) {
+                    ++ctx.total_workers;
+                    spawn_worker(&ctx);
+                }
             }
+            ++accepted;
         }
-        ctx.pool_cv.notify_one();
+        if (accepted == 1) ctx.pool_cv.notify_one();
+        else if (accepted > 1) ctx.pool_cv.notify_all();
     }
 
     close(listen_fd);

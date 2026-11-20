@@ -286,9 +286,12 @@ private:
     std::unordered_map<uint64_t, std::pair<Repo*, PullRequest*>> pull_by_db_id_;
 
     z_stream inf_{};
+    z_stream inf_raw_{};
     z_stream def_{};
     bool inf_ready_ = false;
+    bool inf_raw_ready_ = false;
     bool def_ready_ = false;
+    std::vector<uint8_t> inf_scratch_;
 };
 
 } // namespace forge
