@@ -17,11 +17,11 @@ ForgeStore::ForgeStore(std::string viewer_login, std::string auth_token, int64_t
     }
     repos_.reserve(128);
     repo_by_db_id_.reserve(128);
-    issue_by_db_id_.reserve(1024);
+    issue_by_db_id_.reserve(4096);
     pull_by_db_id_.reserve(128);
     if (inflateInit(&inf_) == Z_OK) inf_ready_ = true;
     if (inflateInit2(&inf_raw_, -15) == Z_OK) inf_raw_ready_ = true;
-    if (deflateInit(&def_, 6) == Z_OK) def_ready_ = true;
+    if (deflateInit(&def_, 9) == Z_OK) def_ready_ = true;
     inf_scratch_.reserve(65536);
 }
 
@@ -113,8 +113,8 @@ Repo* ForgeStore::create_repo(
     repo->is_private = is_private;
     repo->default_branch = default_branch.empty() ? "main" : default_branch;
     repo->created_at = next_timestamp();
-    repo->objects.reserve(2048);
-    repo->issues.reserve(256);
+    repo->objects.reserve(4096);
+    repo->issues.reserve(1024);
     Repo* ptr = repo.get();
     repo_by_db_id_[ptr->db_id] = ptr;
     repo_order_.push_back(ptr);
@@ -553,12 +553,8 @@ bool ForgeStore::unpack_pack(Repo& repo, const uint8_t* data, size_t len, std::s
                 err = "zlib inflate failed";
                 return false;
             }
-            std::vector<uint8_t> comp;
-            if (count > 16) {
-                comp.assign(data + pos, data + pos + consumed);
-            }
             pos += consumed;
-            Oid oid = put_object(repo, static_cast<ObjType>(type_code), std::move(raw), std::move(comp));
+            Oid oid = put_object(repo, static_cast<ObjType>(type_code), std::move(raw));
             record_offset(entry_offset, oid);
         } else if (type_code == 6) {
             if (pos >= body_end) { err = "truncated ofs-delta"; return false; }

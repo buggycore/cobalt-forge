@@ -264,11 +264,28 @@ bool handle_rest(ForgeStore& store, const HttpRequest& req, HttpResponse& res) {
                     build_error_json(res, 422, err, store.next_request_id(), req.keep_alive);
                     return true;
                 }
-                static std::string out;
-                out.clear();
-                out.reserve(128 + iss->title.size() + iss->body.size());
-                ForgeStore::append_issue_json(*repo, *iss, out);
-                build_json_response(res, 201, out, store.next_request_id(), req.keep_alive);
+                // Single-pass zero-copy HTTP 201 + JSON into res.owned_raw
+                static std::string jbuf;
+                jbuf.clear();
+                jbuf.reserve(128 + iss->title.size() + iss->body.size());
+                ForgeStore::append_issue_json(*repo, *iss, jbuf);
+                res.raw_ptr = nullptr;
+                res.raw_len = 0;
+                res.owned_raw.clear();
+                res.owned_raw.reserve(96 + jbuf.size());
+                if (req.keep_alive) {
+                    res.owned_raw.append(
+                        "HTTP/1.1 201 Created\r\n"
+                        "Content-Type: application/json\r\n"
+                        "X-GitHub-Request-Id: ", 75);
+                    append_u64_hex(res.owned_raw, store.next_request_id());
+                    res.owned_raw.append("\r\nContent-Length: ", 18);
+                    append_u64_dec(res.owned_raw, jbuf.size());
+                    res.owned_raw.append("\r\n\r\n", 4);
+                    res.owned_raw.append(jbuf);
+                } else {
+                    build_json_response(res, 201, jbuf, store.next_request_id(), false);
+                }
                 return true;
             }
         }

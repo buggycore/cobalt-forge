@@ -1,6 +1,6 @@
 CXX := g++
-CXXFLAGS := -O3 -std=c++20 -march=x86-64 -pthread -Wall -Wextra -Wno-unused-parameter
-LDFLAGS := -pthread -static -s
+CXXFLAGS := -O3 -std=c++20 -march=x86-64 -Wall -Wextra -Wno-unused-parameter
+LDFLAGS := -static -s
 LIBS := -lz
 
 SRCS := src/store.cpp src/git_http.cpp src/rest.cpp src/graphql.cpp src/mcp.cpp src/server.cpp
