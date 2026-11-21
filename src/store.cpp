@@ -16,13 +16,10 @@ ForgeStore::ForgeStore(std::string viewer_login, std::string auth_token, int64_t
         expected_bearer_ = "Bearer " + auth_token_;
     }
     repos_.reserve(128);
-    repo_by_db_id_.reserve(128);
-    issue_by_db_id_.reserve(4096);
-    pull_by_db_id_.reserve(128);
+    nodes_by_id_.reserve(4096);
     if (inflateInit(&inf_) == Z_OK) inf_ready_ = true;
     if (inflateInit2(&inf_raw_, -15) == Z_OK) inf_raw_ready_ = true;
     if (deflateInit(&def_, 9) == Z_OK) def_ready_ = true;
-    inf_scratch_.reserve(65536);
 }
 
 ForgeStore::~ForgeStore() {
@@ -113,10 +110,8 @@ Repo* ForgeStore::create_repo(
     repo->is_private = is_private;
     repo->default_branch = default_branch.empty() ? "main" : default_branch;
     repo->created_at = next_timestamp();
-    repo->objects.reserve(4096);
-    repo->issues.reserve(1024);
     Repo* ptr = repo.get();
-    repo_by_db_id_[ptr->db_id] = ptr;
+    register_node(ptr->db_id, NodeLookup{NodeLookup::Kind::Repo, ptr, nullptr, nullptr});
     repo_order_.push_back(ptr);
     repos_.emplace(name, std::move(repo));
     last_repo_ = ptr;
@@ -146,9 +141,13 @@ bool ForgeStore::delete_repo(std::string_view owner, std::string_view name) {
     if (it == repos_.end()) return false;
     Repo* ptr = it->second.get();
     if (last_repo_ == ptr) last_repo_ = nullptr;
-    repo_by_db_id_.erase(ptr->db_id);
-    for (const auto& iss : ptr->issues) issue_by_db_id_.erase(iss->db_id);
-    for (const auto& pr : ptr->pulls) pull_by_db_id_.erase(pr->db_id);
+    if (ptr->db_id < nodes_by_id_.size()) nodes_by_id_[ptr->db_id] = NodeLookup{};
+    for (const auto& iss : ptr->issues) {
+        if (iss.db_id < nodes_by_id_.size()) nodes_by_id_[iss.db_id] = NodeLookup{};
+    }
+    for (const auto& pr : ptr->pulls) {
+        if (pr->db_id < nodes_by_id_.size()) nodes_by_id_[pr->db_id] = NodeLookup{};
+    }
     repo_order_.erase(std::remove(repo_order_.begin(), repo_order_.end(), ptr), repo_order_.end());
     repos_.erase(it);
     return true;
@@ -167,28 +166,22 @@ static bool parse_uint64_sv(std::string_view sv, uint64_t& out) noexcept {
 
 bool ForgeStore::find_node(std::string_view node_id, NodeLookup& out) const noexcept {
     uint64_t id = 0;
+    NodeLookup::Kind want = NodeLookup::Kind::None;
     if (node_id.size() > 2 && node_id[0] == 'R' && node_id[1] == '_') {
         if (!parse_uint64_sv(node_id.substr(2), id)) return false;
-        auto it = repo_by_db_id_.find(id);
-        if (it == repo_by_db_id_.end()) return false;
-        out = NodeLookup{NodeLookup::Kind::Repo, it->second, nullptr, nullptr};
-        return true;
-    }
-    if (node_id.size() > 2 && node_id[0] == 'I' && node_id[1] == '_') {
+        want = NodeLookup::Kind::Repo;
+    } else if (node_id.size() > 2 && node_id[0] == 'I' && node_id[1] == '_') {
         if (!parse_uint64_sv(node_id.substr(2), id)) return false;
-        auto it = issue_by_db_id_.find(id);
-        if (it == issue_by_db_id_.end()) return false;
-        out = NodeLookup{NodeLookup::Kind::Issue, it->second.first, it->second.second, nullptr};
-        return true;
-    }
-    if (node_id.size() > 3 && node_id[0] == 'P' && node_id[1] == 'R' && node_id[2] == '_') {
+        want = NodeLookup::Kind::Issue;
+    } else if (node_id.size() > 3 && node_id[0] == 'P' && node_id[1] == 'R' && node_id[2] == '_') {
         if (!parse_uint64_sv(node_id.substr(3), id)) return false;
-        auto it = pull_by_db_id_.find(id);
-        if (it == pull_by_db_id_.end()) return false;
-        out = NodeLookup{NodeLookup::Kind::PullRequest, it->second.first, nullptr, it->second.second};
-        return true;
+        want = NodeLookup::Kind::PullRequest;
+    } else {
+        return false;
     }
-    return false;
+    if (id >= nodes_by_id_.size() || nodes_by_id_[id].kind != want) return false;
+    out = nodes_by_id_[id];
+    return true;
 }
 
 Label* ForgeStore::create_label(
@@ -209,20 +202,32 @@ Issue* ForgeStore::create_issue(
             return nullptr;
         }
     }
-    auto iss = std::make_unique<Issue>();
-    iss->db_id = next_db_id_++;
-    iss->number = repo.next_issue_number++;
-    iss->created_seq = next_seq_++;
-    iss->created_epoch = base_epoch_ + static_cast<int64_t>(++ts_counter_);
-    iss->updated_epoch = iss->created_epoch;
-    iss->title = std::move(title);
-    iss->body = std::move(body);
-    iss->closed = false;
-    iss->labels = labels;
-    Issue* ptr = iss.get();
-    issue_by_db_id_[ptr->db_id] = {&repo, ptr};
-    repo.issues.push_back(std::move(iss));
-    return ptr;
+    Issue& iss = repo.issues.emplace_back();
+    iss.db_id = next_db_id_++;
+    iss.number = repo.next_issue_number++;
+    iss.created_seq = next_seq_++;
+    iss.created_epoch = base_epoch_ + static_cast<int64_t>(++ts_counter_);
+    iss.updated_epoch = iss.created_epoch;
+    iss.title = std::move(title);
+    iss.body = std::move(body);
+    iss.closed = false;
+    iss.labels = labels;
+    register_node(iss.db_id, NodeLookup{NodeLookup::Kind::Issue, &repo, &iss, nullptr});
+    return &iss;
+}
+
+Issue* ForgeStore::create_issue_fast(Repo& repo, std::string_view title, std::string_view body) {
+    Issue& iss = repo.issues.emplace_back();
+    iss.db_id = next_db_id_++;
+    iss.number = repo.next_issue_number++;
+    iss.created_seq = next_seq_++;
+    iss.created_epoch = base_epoch_ + static_cast<int64_t>(++ts_counter_);
+    iss.updated_epoch = iss.created_epoch;
+    iss.title.assign(title.data(), title.size());
+    iss.body.assign(body.data(), body.size());
+    iss.closed = false;
+    register_node(iss.db_id, NodeLookup{NodeLookup::Kind::Issue, &repo, &iss, nullptr});
+    return &iss;
 }
 
 Comment* ForgeStore::add_comment(Repo& repo, Issue& issue, std::string body) {
@@ -238,11 +243,11 @@ Comment* ForgeStore::add_comment(Repo& repo, Issue& issue, std::string body) {
     return &issue.comments.back();
 }
 
-void ForgeStore::parse_obj_meta(GitObj& obj) {
+void ForgeStore::parse_obj_meta(const Repo& repo, GitObj& obj) {
     if (obj.meta_parsed) return;
     obj.meta_parsed = true;
     if (obj.type == ObjType::Commit) {
-        std::string_view sv(reinterpret_cast<const char*>(obj.raw.data()), obj.raw.size());
+        std::string_view sv = repo.raw_sv(obj);
         size_t pos = 0;
         while (pos < sv.size()) {
             size_t nl = sv.find('\n', pos);
@@ -254,14 +259,22 @@ void ForgeStore::parse_obj_meta(GitObj& obj) {
                 parse_oid(line.substr(5), obj.tree_oid);
             } else if (line.size() == 47 && line.substr(0, 7) == "parent ") {
                 Oid p;
-                if (parse_oid(line.substr(7), p)) obj.parents.push_back(p);
+                if (parse_oid(line.substr(7), p)) {
+                    if (obj.parent_count == 0) {
+                        obj.parent0 = p;
+                        obj.parent_count = 1;
+                    } else {
+                        obj.extra_parents.push_back(p);
+                        if (obj.parent_count < 255) ++obj.parent_count;
+                    }
+                }
             } else if (line[0] == 'a' || line[0] == 'c') {
                 // In git commits, tree and parent headers always precede author/committer
                 break;
             }
         }
     } else if (obj.type == ObjType::Tag) {
-        std::string_view sv(reinterpret_cast<const char*>(obj.raw.data()), obj.raw.size());
+        std::string_view sv = repo.raw_sv(obj);
         size_t pos = 0;
         while (pos < sv.size()) {
             size_t nl = sv.find('\n', pos);
@@ -282,85 +295,84 @@ void ForgeStore::parse_obj_meta(GitObj& obj) {
     }
 }
 
-std::string_view ForgeStore::commit_message(const GitObj& obj) noexcept {
-    std::string_view sv(reinterpret_cast<const char*>(obj.raw.data()), obj.raw.size());
+std::string_view ForgeStore::commit_message(const Repo& repo, const GitObj& obj) noexcept {
+    std::string_view sv = repo.raw_sv(obj);
     size_t blank = sv.find("\n\n");
     if (blank == std::string_view::npos) return {};
     return sv.substr(blank + 2);
 }
 
-Oid ForgeStore::put_object(
-    Repo& repo, ObjType type, std::vector<uint8_t> raw, std::vector<uint8_t> compressed) {
-    Oid oid = hash_object(type, raw.data(), raw.size());
-    auto it = repo.objects.find(oid);
-    if (it != repo.objects.end()) {
-        if (it->second.compressed.empty() && !compressed.empty()) {
-            it->second.compressed = std::move(compressed);
-        }
+Oid ForgeStore::put_object_arena(Repo& repo, ObjType type, size_t raw_off, size_t raw_len) {
+    const uint8_t* ptr = raw_len ? (repo.raw_arena.data() + raw_off) : nullptr;
+    Oid oid = hash_object(type, ptr, raw_len);
+    if (repo.objects.find(oid) != repo.objects.end()) {
+        // Rollback duplicate bytes immediately (caller just appended [raw_off, raw_off + raw_len))
+        repo.raw_arena.resize(raw_off);
         return oid;
     }
     GitObj obj;
     obj.type = type;
-    obj.raw = std::move(raw);
-    obj.compressed = std::move(compressed);
+    obj.raw_off = static_cast<uint32_t>(raw_off);
+    obj.raw_len = static_cast<uint32_t>(raw_len);
     repo.objects.emplace(oid, std::move(obj));
     return oid;
 }
 
-bool ForgeStore::inflate_slice(
-    const uint8_t* src, size_t max_len, size_t expected_size, std::vector<uint8_t>& out, size_t& consumed) {
-    // Fast raw-deflate path (skips redundant per-object Adler-32 since pack SHA-1 trailer already verifies integrity).
+Oid ForgeStore::put_object_bytes(Repo& repo, ObjType type, const uint8_t* data, size_t len) {
+    Oid oid = hash_object(type, data, len);
+    if (repo.objects.find(oid) != repo.objects.end()) {
+        return oid;
+    }
+    if (repo.raw_arena.empty() && repo.raw_arena.capacity() < (1u << 20)) {
+        repo.raw_arena.reserve(1u << 20);
+    }
+    if (repo.objects.bucket_count() == 0) {
+        repo.objects.reserve(4096);
+    }
+    size_t off = repo.raw_arena.size();
+    if (len > 0) {
+        repo.raw_arena.resize(off + len);
+        std::memcpy(repo.raw_arena.data() + off, data, len);
+    }
+    GitObj obj;
+    obj.type = type;
+    obj.raw_off = static_cast<uint32_t>(off);
+    obj.raw_len = static_cast<uint32_t>(len);
+    repo.objects.emplace(oid, std::move(obj));
+    return oid;
+}
+
+Oid ForgeStore::put_object(Repo& repo, ObjType type, const std::vector<uint8_t>& raw) {
+    return put_object_bytes(repo, type, raw.data(), raw.size());
+}
+
+bool ForgeStore::inflate_into(
+    const uint8_t* src, size_t max_len, size_t expected_size, uint8_t* dst, size_t& consumed) {
+    // Fast raw-deflate path: inflates directly into dst (zero scratch copy, skips redundant Adler-32).
     if (inf_raw_ready_ && max_len >= 6 && (src[0] & 0x0fu) == 8 && (src[1] & 0x20u) == 0 &&
         (((static_cast<unsigned>(src[0]) << 8) | src[1]) % 31u) == 0u) {
         inflateReset(&inf_raw_);
-        if (expected_size == 0) {
-            uint8_t dummy = 0;
-            inf_raw_.next_in = const_cast<Bytef*>(src + 2);
-            inf_raw_.avail_in = static_cast<uInt>(max_len - 2);
-            inf_raw_.next_out = &dummy;
-            inf_raw_.avail_out = 0;
-            int ret = inflate(&inf_raw_, Z_FINISH);
-            if (ret == Z_STREAM_END) {
-                size_t raw_used = (max_len - 2) - inf_raw_.avail_in;
-                if (2 + raw_used + 4 <= max_len) {
-                    out.clear();
-                    consumed = 2 + raw_used + 4;
-                    return true;
-                }
-            }
-        } else {
-            if (inf_scratch_.size() < expected_size) inf_scratch_.resize(expected_size);
-            inf_raw_.next_in = const_cast<Bytef*>(src + 2);
-            inf_raw_.avail_in = static_cast<uInt>(max_len - 2);
-            inf_raw_.next_out = inf_scratch_.data();
-            inf_raw_.avail_out = static_cast<uInt>(expected_size);
-            int ret = inflate(&inf_raw_, Z_FINISH);
-            if (ret == Z_STREAM_END && inf_raw_.avail_out == 0) {
-                size_t raw_used = (max_len - 2) - inf_raw_.avail_in;
-                if (2 + raw_used + 4 <= max_len) {
-                    out.assign(inf_scratch_.data(), inf_scratch_.data() + expected_size);
-                    consumed = 2 + raw_used + 4;
-                    return true;
-                }
+        uint8_t dummy = 0;
+        inf_raw_.next_in = const_cast<Bytef*>(src + 2);
+        inf_raw_.avail_in = static_cast<uInt>(max_len - 2);
+        inf_raw_.next_out = expected_size ? dst : &dummy;
+        inf_raw_.avail_out = static_cast<uInt>(expected_size);
+        int ret = inflate(&inf_raw_, Z_FINISH);
+        if (ret == Z_STREAM_END && inf_raw_.avail_out == 0) {
+            size_t raw_used = (max_len - 2) - inf_raw_.avail_in;
+            if (2 + raw_used + 4 <= max_len) {
+                consumed = 2 + raw_used + 4;
+                return true;
             }
         }
     }
 
     if (!inf_ready_) return false;
     inflateReset(&inf_);
-    out.resize(expected_size);
+    uint8_t dummy = 0;
     inf_.next_in = const_cast<Bytef*>(src);
     inf_.avail_in = static_cast<uInt>(max_len);
-    if (expected_size == 0) {
-        uint8_t dummy = 0;
-        inf_.next_out = &dummy;
-        inf_.avail_out = 0;
-        int ret = inflate(&inf_, Z_FINISH);
-        if (ret != Z_STREAM_END) return false;
-        consumed = max_len - inf_.avail_in;
-        return true;
-    }
-    inf_.next_out = out.data();
+    inf_.next_out = expected_size ? dst : &dummy;
     inf_.avail_out = static_cast<uInt>(expected_size);
     int ret = inflate(&inf_, Z_FINISH);
     if (ret == Z_STREAM_END && inf_.avail_out == 0) {
@@ -403,22 +415,22 @@ bool ForgeStore::deflate_bytes(const uint8_t* src, size_t len, std::vector<uint8
     return true;
 }
 
-const std::vector<uint8_t>& ForgeStore::ensure_compressed(GitObj& obj) {
+const std::vector<uint8_t>& ForgeStore::ensure_compressed(const Repo& repo, GitObj& obj) {
     if (obj.compressed.empty()) {
-        deflate_bytes(obj.raw.data(), obj.raw.size(), obj.compressed);
+        deflate_bytes(repo.raw_data(obj), obj.raw_len, obj.compressed);
     }
     return obj.compressed;
 }
 
 bool ForgeStore::apply_delta(
-    const std::vector<uint8_t>& base, const std::vector<uint8_t>& delta, std::vector<uint8_t>& out) {
+    const uint8_t* base_data, size_t base_len, const uint8_t* delta_data, size_t delta_len, std::vector<uint8_t>& out) {
     size_t pos = 0;
     auto read_size = [&](size_t& val) -> bool {
         val = 0;
         int shift = 0;
         for (;;) {
-            if (pos >= delta.size() || shift > 60) return false;
-            uint8_t b = delta[pos++];
+            if (pos >= delta_len || shift > 60) return false;
+            uint8_t b = delta_data[pos++];
             val |= static_cast<size_t>(b & 0x7fu) << shift;
             if ((b & 0x80u) == 0) return true;
             shift += 7;
@@ -426,27 +438,27 @@ bool ForgeStore::apply_delta(
     };
     size_t src_size = 0, dst_size = 0;
     if (!read_size(src_size) || !read_size(dst_size)) return false;
-    if (src_size != base.size()) return false;
+    if (src_size != base_len) return false;
     out.resize(dst_size);
     size_t written = 0;
-    while (pos < delta.size()) {
-        uint8_t op = delta[pos++];
+    while (pos < delta_len) {
+        uint8_t op = delta_data[pos++];
         if (op & 0x80u) {
             size_t cp_off = 0, cp_sz = 0;
-            if (op & 0x01u) { if (pos >= delta.size()) return false; cp_off |= delta[pos++]; }
-            if (op & 0x02u) { if (pos >= delta.size()) return false; cp_off |= static_cast<size_t>(delta[pos++]) << 8; }
-            if (op & 0x04u) { if (pos >= delta.size()) return false; cp_off |= static_cast<size_t>(delta[pos++]) << 16; }
-            if (op & 0x08u) { if (pos >= delta.size()) return false; cp_off |= static_cast<size_t>(delta[pos++]) << 24; }
-            if (op & 0x10u) { if (pos >= delta.size()) return false; cp_sz |= delta[pos++]; }
-            if (op & 0x20u) { if (pos >= delta.size()) return false; cp_sz |= static_cast<size_t>(delta[pos++]) << 8; }
-            if (op & 0x40u) { if (pos >= delta.size()) return false; cp_sz |= static_cast<size_t>(delta[pos++]) << 16; }
+            if (op & 0x01u) { if (pos >= delta_len) return false; cp_off |= delta_data[pos++]; }
+            if (op & 0x02u) { if (pos >= delta_len) return false; cp_off |= static_cast<size_t>(delta_data[pos++]) << 8; }
+            if (op & 0x04u) { if (pos >= delta_len) return false; cp_off |= static_cast<size_t>(delta_data[pos++]) << 16; }
+            if (op & 0x08u) { if (pos >= delta_len) return false; cp_off |= static_cast<size_t>(delta_data[pos++]) << 24; }
+            if (op & 0x10u) { if (pos >= delta_len) return false; cp_sz |= delta_data[pos++]; }
+            if (op & 0x20u) { if (pos >= delta_len) return false; cp_sz |= static_cast<size_t>(delta_data[pos++]) << 8; }
+            if (op & 0x40u) { if (pos >= delta_len) return false; cp_sz |= static_cast<size_t>(delta_data[pos++]) << 16; }
             if (cp_sz == 0) cp_sz = 0x10000;
-            if (cp_off + cp_sz > base.size() || written + cp_sz > dst_size) return false;
-            std::memcpy(out.data() + written, base.data() + cp_off, cp_sz);
+            if (cp_off + cp_sz > base_len || written + cp_sz > dst_size) return false;
+            std::memcpy(out.data() + written, base_data + cp_off, cp_sz);
             written += cp_sz;
         } else if (op != 0) {
-            if (pos + op > delta.size() || written + op > dst_size) return false;
-            std::memcpy(out.data() + written, delta.data() + pos, op);
+            if (pos + op > delta_len || written + op > dst_size) return false;
+            std::memcpy(out.data() + written, delta_data + pos, op);
             pos += op;
             written += op;
         } else {
@@ -479,6 +491,9 @@ bool ForgeStore::unpack_pack(Repo& repo, const uint8_t* data, size_t len, std::s
         err = "pack checksum mismatch";
         return false;
     }
+
+    if (repo.raw_arena.capacity() < (1u << 20)) repo.raw_arena.reserve(1u << 20);
+    if (repo.objects.bucket_count() == 0) repo.objects.reserve(4096);
 
     struct PendingDelta {
         size_t offset = 0;
@@ -547,14 +562,16 @@ bool ForgeStore::unpack_pack(Repo& repo, const uint8_t* data, size_t len, std::s
         }
 
         if (type_code >= 1 && type_code <= 4) {
-            std::vector<uint8_t> raw;
+            size_t off = repo.raw_arena.size();
+            repo.raw_arena.resize(off + size);
             size_t consumed = 0;
-            if (!inflate_slice(data + pos, body_end - pos, size, raw, consumed)) {
+            if (!inflate_into(data + pos, body_end - pos, size, size ? (repo.raw_arena.data() + off) : nullptr, consumed)) {
+                repo.raw_arena.resize(off);
                 err = "zlib inflate failed";
                 return false;
             }
             pos += consumed;
-            Oid oid = put_object(repo, static_cast<ObjType>(type_code), std::move(raw));
+            Oid oid = put_object_arena(repo, static_cast<ObjType>(type_code), off, size);
             record_offset(entry_offset, oid);
         } else if (type_code == 6) {
             if (pos >= body_end) { err = "truncated ofs-delta"; return false; }
@@ -566,9 +583,9 @@ bool ForgeStore::unpack_pack(Repo& repo, const uint8_t* data, size_t len, std::s
                 back = ((back + 1) << 7) | (b & 0x7fu);
             }
             if (back == 0 || back > entry_offset) { err = "bad ofs-delta base"; return false; }
-            std::vector<uint8_t> delta;
+            std::vector<uint8_t> delta(size);
             size_t consumed = 0;
-            if (!inflate_slice(data + pos, body_end - pos, size, delta, consumed)) {
+            if (!inflate_into(data + pos, body_end - pos, size, size ? delta.data() : nullptr, consumed)) {
                 err = "zlib inflate failed on ofs-delta";
                 return false;
             }
@@ -579,11 +596,11 @@ bool ForgeStore::unpack_pack(Repo& repo, const uint8_t* data, size_t len, std::s
                 auto oit = repo.objects.find(base_oid);
                 if (oit != repo.objects.end()) {
                     std::vector<uint8_t> resolved;
-                    if (!apply_delta(oit->second.raw, delta, resolved)) {
+                    if (!apply_delta(repo.raw_data(oit->second), oit->second.raw_len, delta.data(), delta.size(), resolved)) {
                         err = "ofs-delta apply failed";
                         return false;
                     }
-                    Oid oid = put_object(repo, oit->second.type, std::move(resolved));
+                    Oid oid = put_object(repo, oit->second.type, resolved);
                     record_offset(entry_offset, oid);
                     continue;
                 }
@@ -594,9 +611,9 @@ bool ForgeStore::unpack_pack(Repo& repo, const uint8_t* data, size_t len, std::s
             Oid base_oid;
             std::memcpy(base_oid.bytes.data(), data + pos, 20);
             pos += 20;
-            std::vector<uint8_t> delta;
+            std::vector<uint8_t> delta(size);
             size_t consumed = 0;
-            if (!inflate_slice(data + pos, body_end - pos, size, delta, consumed)) {
+            if (!inflate_into(data + pos, body_end - pos, size, size ? delta.data() : nullptr, consumed)) {
                 err = "zlib inflate failed on ref-delta";
                 return false;
             }
@@ -604,11 +621,11 @@ bool ForgeStore::unpack_pack(Repo& repo, const uint8_t* data, size_t len, std::s
             auto oit = repo.objects.find(base_oid);
             if (oit != repo.objects.end()) {
                 std::vector<uint8_t> resolved;
-                if (!apply_delta(oit->second.raw, delta, resolved)) {
+                if (!apply_delta(repo.raw_data(oit->second), oit->second.raw_len, delta.data(), delta.size(), resolved)) {
                     err = "ref-delta apply failed";
                     return false;
                 }
-                Oid oid = put_object(repo, oit->second.type, std::move(resolved));
+                Oid oid = put_object(repo, oit->second.type, resolved);
                 record_offset(entry_offset, oid);
             } else {
                 pending_deltas.push_back(PendingDelta{entry_offset, false, 0, base_oid, std::move(delta)});
@@ -630,11 +647,11 @@ bool ForgeStore::unpack_pack(Repo& repo, const uint8_t* data, size_t len, std::s
             auto oit = repo.objects.find(base_oid);
             if (oit == repo.objects.end()) { remaining.push_back(std::move(pd)); continue; }
             std::vector<uint8_t> resolved;
-            if (!apply_delta(oit->second.raw, pd.delta, resolved)) {
+            if (!apply_delta(repo.raw_data(oit->second), oit->second.raw_len, pd.delta.data(), pd.delta.size(), resolved)) {
                 err = "delta apply failed";
                 return false;
             }
-            Oid oid = put_object(repo, oit->second.type, std::move(resolved));
+            Oid oid = put_object(repo, oit->second.type, resolved);
             record_offset(pd.offset, oid);
         }
         if (remaining.size() == before) {
@@ -662,7 +679,7 @@ std::vector<uint8_t> ForgeStore::build_pack(Repo& repo, const std::vector<Oid>& 
         auto it = repo.objects.find(oid);
         if (it == repo.objects.end()) continue;
         GitObj& obj = it->second;
-        size_t sz = obj.raw.size();
+        size_t sz = obj.raw_len;
         uint8_t first = static_cast<uint8_t>((static_cast<uint8_t>(obj.type) << 4) | (sz & 0x0fu));
         sz >>= 4;
         if (sz > 0) first |= 0x80u;
@@ -673,7 +690,7 @@ std::vector<uint8_t> ForgeStore::build_pack(Repo& repo, const std::vector<Oid>& 
             if (sz > 0) b |= 0x80u;
             out.push_back(b);
         }
-        const auto& comp = ensure_compressed(obj);
+        const auto& comp = ensure_compressed(repo, obj);
         out.insert(out.end(), comp.begin(), comp.end());
     }
 
@@ -682,20 +699,20 @@ std::vector<uint8_t> ForgeStore::build_pack(Repo& repo, const std::vector<Oid>& 
     return out;
 }
 
-std::vector<TreeEntry> ForgeStore::parse_tree(const std::vector<uint8_t>& raw) {
+std::vector<TreeEntry> ForgeStore::parse_tree(const uint8_t* raw, size_t len) {
     std::vector<TreeEntry> entries;
     size_t pos = 0;
-    while (pos < raw.size()) {
+    while (pos < len) {
         size_t sp = pos;
-        while (sp < raw.size() && raw[sp] != ' ') ++sp;
-        if (sp >= raw.size()) break;
+        while (sp < len && raw[sp] != ' ') ++sp;
+        if (sp >= len) break;
         size_t nul = sp + 1;
-        while (nul < raw.size() && raw[nul] != 0) ++nul;
-        if (nul + 21 > raw.size()) break;
+        while (nul < len && raw[nul] != 0) ++nul;
+        if (nul + 21 > len) break;
         TreeEntry e;
-        e.mode.assign(reinterpret_cast<const char*>(raw.data() + pos), sp - pos);
-        e.name.assign(reinterpret_cast<const char*>(raw.data() + sp + 1), nul - sp - 1);
-        std::memcpy(e.oid.bytes.data(), raw.data() + nul + 1, 20);
+        e.mode.assign(reinterpret_cast<const char*>(raw + pos), sp - pos);
+        e.name.assign(reinterpret_cast<const char*>(raw + sp + 1), nul - sp - 1);
+        std::memcpy(e.oid.bytes.data(), raw + nul + 1, 20);
         entries.push_back(std::move(e));
         pos = nul + 21;
     }
@@ -740,16 +757,19 @@ std::vector<uint8_t> ForgeStore::build_commit_bytes(
     return std::vector<uint8_t>(s.begin(), s.end());
 }
 
-bool ForgeStore::is_ancestor(Repo& repo, const Oid& ancestor, const Oid& descendant) {
+bool ForgeStore::is_ancestor_obj(Repo& repo, const Oid& ancestor, const Oid& descendant, GitObj& desc_obj) {
     if (ancestor == descendant) return true;
-    auto dit = repo.objects.find(descendant);
-    if (dit == repo.objects.end() || dit->second.type != ObjType::Commit) return false;
-    parse_obj_meta(dit->second);
-    for (const auto& p : dit->second.parents) {
-        if (p == ancestor) return true;
+    if (desc_obj.type != ObjType::Commit) return false;
+    parse_obj_meta(repo, desc_obj);
+    if (desc_obj.parent_count > 0) {
+        if (desc_obj.parent0 == ancestor) return true;
+        for (const auto& p : desc_obj.extra_parents) {
+            if (p == ancestor) return true;
+        }
     }
     std::unordered_set<Oid, OidHash> seen;
-    std::vector<Oid> stack = dit->second.parents;
+    std::vector<Oid> stack;
+    desc_obj.for_each_parent([&](const Oid& p) { stack.push_back(p); });
     seen.insert(descendant);
     while (!stack.empty()) {
         Oid cur = stack.back();
@@ -758,13 +778,22 @@ bool ForgeStore::is_ancestor(Repo& repo, const Oid& ancestor, const Oid& descend
         if (!seen.insert(cur).second) continue;
         auto it = repo.objects.find(cur);
         if (it == repo.objects.end() || it->second.type != ObjType::Commit) continue;
-        parse_obj_meta(it->second);
-        for (const auto& p : it->second.parents) {
-            if (p == ancestor) return true;
-            if (seen.find(p) == seen.end()) stack.push_back(p);
-        }
+        parse_obj_meta(repo, it->second);
+        bool hit = false;
+        it->second.for_each_parent([&](const Oid& p) {
+            if (p == ancestor) hit = true;
+            else if (seen.find(p) == seen.end()) stack.push_back(p);
+        });
+        if (hit) return true;
     }
     return false;
+}
+
+bool ForgeStore::is_ancestor(Repo& repo, const Oid& ancestor, const Oid& descendant) {
+    if (ancestor == descendant) return true;
+    auto dit = repo.objects.find(descendant);
+    if (dit == repo.objects.end()) return false;
+    return is_ancestor_obj(repo, ancestor, descendant, dit->second);
 }
 
 Oid ForgeStore::find_merge_base(Repo& repo, const Oid& a, const Oid& b) {
@@ -779,10 +808,10 @@ Oid ForgeStore::find_merge_base(Repo& repo, const Oid& a, const Oid& b) {
             q.pop();
             auto it = repo.objects.find(cur);
             if (it == repo.objects.end() || it->second.type != ObjType::Commit) continue;
-            parse_obj_meta(it->second);
-            for (const auto& p : it->second.parents) {
+            parse_obj_meta(repo, it->second);
+            it->second.for_each_parent([&](const Oid& p) {
                 if (anc_a.insert(p).second) q.push(p);
-            }
+            });
         }
     }
     std::unordered_set<Oid, OidHash> seen_b;
@@ -795,10 +824,10 @@ Oid ForgeStore::find_merge_base(Repo& repo, const Oid& a, const Oid& b) {
         if (anc_a.find(cur) != anc_a.end()) return cur;
         auto it = repo.objects.find(cur);
         if (it == repo.objects.end() || it->second.type != ObjType::Commit) continue;
-        parse_obj_meta(it->second);
-        for (const auto& p : it->second.parents) {
+        parse_obj_meta(repo, it->second);
+        it->second.for_each_parent([&](const Oid& p) {
             if (seen_b.insert(p).second) q.push(p);
-        }
+        });
     }
     return Oid{};
 }
@@ -829,7 +858,7 @@ Oid ForgeStore::peel_oid(Repo& repo, const Oid& start) {
     for (int depth = 0; depth < 16; ++depth) {
         auto it = repo.objects.find(cur);
         if (it == repo.objects.end() || it->second.type != ObjType::Tag) break;
-        parse_obj_meta(it->second);
+        parse_obj_meta(repo, it->second);
         if (it->second.tag_target.is_zero()) break;
         cur = it->second.tag_target;
     }
@@ -841,7 +870,7 @@ void ForgeStore::flatten_tree(
     if (tree_oid.is_zero()) return;
     auto it = repo.objects.find(tree_oid);
     if (it == repo.objects.end() || it->second.type != ObjType::Tree) return;
-    auto entries = parse_tree(it->second.raw);
+    auto entries = parse_tree(repo.raw_data(it->second), it->second.raw_len);
     for (const auto& e : entries) {
         std::string full = prefix.empty() ? e.name : (prefix + "/" + e.name);
         if (e.mode == "40000") {
@@ -907,7 +936,7 @@ bool ForgeStore::lookup_path_in_tree(
         std::string_view seg = last ? path.substr(pos) : path.substr(pos, slash - pos);
         auto it = repo.objects.find(cur);
         if (it == repo.objects.end() || it->second.type != ObjType::Tree) return false;
-        auto entries = parse_tree(it->second.raw);
+        auto entries = parse_tree(repo.raw_data(it->second), it->second.raw_len);
         bool found = false;
         for (const auto& e : entries) {
             if (e.name == seg) {
@@ -968,7 +997,7 @@ bool ForgeStore::put_file_content(
     if (has_parent) {
         auto cit = repo.objects.find(parent_oid);
         if (cit != repo.objects.end() && cit->second.type == ObjType::Commit) {
-            parse_obj_meta(cit->second);
+            parse_obj_meta(repo, cit->second);
             flatten_tree(repo, cit->second.tree_oid, "", files);
         }
     }
@@ -1030,7 +1059,7 @@ bool ForgeStore::delete_file_content(
     std::map<std::string, Oid> files;
     auto cit = repo.objects.find(parent_oid);
     if (cit != repo.objects.end() && cit->second.type == ObjType::Commit) {
-        parse_obj_meta(cit->second);
+        parse_obj_meta(repo, cit->second);
         flatten_tree(repo, cit->second.tree_oid, "", files);
     }
 
@@ -1059,11 +1088,11 @@ bool ForgeStore::delete_file_content(
     return true;
 }
 
-static uint32_t count_lines(const std::vector<uint8_t>& data) {
-    if (data.empty()) return 0;
+static uint32_t count_lines(const uint8_t* data, size_t len) {
+    if (len == 0) return 0;
     uint32_t n = 0;
-    for (uint8_t b : data) if (b == '\n') ++n;
-    if (data.back() != '\n') ++n;
+    for (size_t i = 0; i < len; ++i) if (data[i] == '\n') ++n;
+    if (data[len - 1] != '\n') ++n;
     return n;
 }
 
@@ -1098,7 +1127,7 @@ PullRequest* ForgeStore::create_pull(
     pr->updated_at = pr->created_at;
     PullRequest* ptr = pr.get();
     repo.pull_by_number[ptr->number] = ptr;
-    pull_by_db_id_[ptr->db_id] = {&repo, ptr};
+    register_node(ptr->db_id, NodeLookup{NodeLookup::Kind::PullRequest, &repo, nullptr, ptr});
     repo.pulls.push_back(std::move(pr));
     return ptr;
 }
@@ -1115,11 +1144,11 @@ std::vector<DiffFile> ForgeStore::diff_pull(Repo& repo, const PullRequest& pr) {
 
     std::map<std::string, Oid> base_files, head_files;
     if (auto it = repo.objects.find(cmp_base); it != repo.objects.end() && it->second.type == ObjType::Commit) {
-        parse_obj_meta(it->second);
+        parse_obj_meta(repo, it->second);
         flatten_tree(repo, it->second.tree_oid, "", base_files);
     }
     if (auto it = repo.objects.find(head_oid); it != repo.objects.end() && it->second.type == ObjType::Commit) {
-        parse_obj_meta(it->second);
+        parse_obj_meta(repo, it->second);
         flatten_tree(repo, it->second.tree_oid, "", head_files);
     }
 
@@ -1129,13 +1158,13 @@ std::vector<DiffFile> ForgeStore::diff_pull(Repo& repo, const PullRequest& pr) {
         if (bit == base_files.end()) {
             uint32_t add = 1;
             if (auto oit = repo.objects.find(h_oid); oit != repo.objects.end()) {
-                add = std::max<uint32_t>(1, count_lines(oit->second.raw));
+                add = std::max<uint32_t>(1, count_lines(repo.raw_data(oit->second), oit->second.raw_len));
             }
             diffs.push_back(DiffFile{path, "added", add, 0, add, h_oid});
         } else if (bit->second != h_oid) {
             uint32_t bl = 1, hl = 1;
-            if (auto oit = repo.objects.find(bit->second); oit != repo.objects.end()) bl = std::max<uint32_t>(1, count_lines(oit->second.raw));
-            if (auto oit = repo.objects.find(h_oid); oit != repo.objects.end()) hl = std::max<uint32_t>(1, count_lines(oit->second.raw));
+            if (auto oit = repo.objects.find(bit->second); oit != repo.objects.end()) bl = std::max<uint32_t>(1, count_lines(repo.raw_data(oit->second), oit->second.raw_len));
+            if (auto oit = repo.objects.find(h_oid); oit != repo.objects.end()) hl = std::max<uint32_t>(1, count_lines(repo.raw_data(oit->second), oit->second.raw_len));
             diffs.push_back(DiffFile{path, "modified", hl, bl, hl + bl, h_oid});
         }
     }
@@ -1143,7 +1172,7 @@ std::vector<DiffFile> ForgeStore::diff_pull(Repo& repo, const PullRequest& pr) {
         if (head_files.find(path) == head_files.end()) {
             uint32_t del = 1;
             if (auto oit = repo.objects.find(b_oid); oit != repo.objects.end()) {
-                del = std::max<uint32_t>(1, count_lines(oit->second.raw));
+                del = std::max<uint32_t>(1, count_lines(repo.raw_data(oit->second), oit->second.raw_len));
             }
             diffs.push_back(DiffFile{path, "removed", 0, del, del, b_oid});
         }
@@ -1165,16 +1194,16 @@ bool ForgeStore::is_pull_mergeable(Repo& repo, const PullRequest& pr) {
     std::map<std::string, Oid> m_files, b_files, h_files;
     if (!mb.is_zero()) {
         if (auto it = repo.objects.find(mb); it != repo.objects.end() && it->second.type == ObjType::Commit) {
-            parse_obj_meta(it->second);
+            parse_obj_meta(repo, it->second);
             flatten_tree(repo, it->second.tree_oid, "", m_files);
         }
     }
     if (auto it = repo.objects.find(base_oid); it != repo.objects.end() && it->second.type == ObjType::Commit) {
-        parse_obj_meta(it->second);
+        parse_obj_meta(repo, it->second);
         flatten_tree(repo, it->second.tree_oid, "", b_files);
     }
     if (auto it = repo.objects.find(head_oid); it != repo.objects.end() && it->second.type == ObjType::Commit) {
-        parse_obj_meta(it->second);
+        parse_obj_meta(repo, it->second);
         flatten_tree(repo, it->second.tree_oid, "", h_files);
     }
 
@@ -1212,16 +1241,16 @@ bool ForgeStore::merge_pull(
     std::map<std::string, Oid> m_files, b_files, h_files;
     if (!mb.is_zero()) {
         if (auto it = repo.objects.find(mb); it != repo.objects.end() && it->second.type == ObjType::Commit) {
-            parse_obj_meta(it->second);
+            parse_obj_meta(repo, it->second);
             flatten_tree(repo, it->second.tree_oid, "", m_files);
         }
     }
     if (auto it = repo.objects.find(base_oid); it != repo.objects.end() && it->second.type == ObjType::Commit) {
-        parse_obj_meta(it->second);
+        parse_obj_meta(repo, it->second);
         flatten_tree(repo, it->second.tree_oid, "", b_files);
     }
     if (auto it = repo.objects.find(head_oid); it != repo.objects.end() && it->second.type == ObjType::Commit) {
-        parse_obj_meta(it->second);
+        parse_obj_meta(repo, it->second);
         flatten_tree(repo, it->second.tree_oid, "", h_files);
     }
 

@@ -105,7 +105,7 @@ void collect_tree_and_blobs(
     auto it = repo.objects.find(tree_oid);
     if (it == repo.objects.end() || it->second.type != ObjType::Tree) return;
     out.push_back(tree_oid);
-    auto entries = ForgeStore::parse_tree(it->second.raw);
+    auto entries = ForgeStore::parse_tree(repo.raw_data(it->second), it->second.raw_len);
     for (const auto& e : entries) {
         if (e.mode == "160000") continue; // gitlink
         if (e.mode == "40000") {
@@ -139,20 +139,20 @@ void collect_reachable_full(
         out.push_back(cur);
         GitObj& obj = it->second;
         if (obj.type == ObjType::Commit) {
-            store.parse_obj_meta(obj);
+            store.parse_obj_meta(repo, obj);
             collect_tree_and_blobs(store, repo, obj.tree_oid, exclude, seen, out);
             if (!shallow_stop.count(cur)) {
-                for (const auto& p : obj.parents) {
+                obj.for_each_parent([&](const Oid& p) {
                     if (!exclude.count(p) && !seen.count(p)) stack.push_back(p);
-                }
+                });
             }
         } else if (obj.type == ObjType::Tag) {
-            store.parse_obj_meta(obj);
+            store.parse_obj_meta(repo, obj);
             if (!obj.tag_target.is_zero() && !exclude.count(obj.tag_target) && !seen.count(obj.tag_target)) {
                 stack.push_back(obj.tag_target);
             }
         } else if (obj.type == ObjType::Tree) {
-            auto entries = ForgeStore::parse_tree(obj.raw);
+            auto entries = ForgeStore::parse_tree(repo.raw_data(obj), obj.raw_len);
             for (const auto& e : entries) {
                 if (e.mode == "160000") continue;
                 if (!exclude.count(e.oid) && !seen.count(e.oid)) stack.push_back(e.oid);
@@ -231,7 +231,7 @@ void compute_fetch_objects(
             auto it = repo.objects.find(cur);
             if (it == repo.objects.end() || it->second.type != ObjType::Commit) continue;
             GitObj& obj = it->second;
-            store.parse_obj_meta(obj);
+            store.parse_obj_meta(repo, obj);
 
             if (!have_objs.count(cur) && want_seen.insert(cur).second) {
                 out_objs.push_back(cur);
@@ -239,19 +239,19 @@ void compute_fetch_objects(
             collect_tree_and_blobs(store, repo, obj.tree_oid, have_objs, want_seen, out_objs);
 
             if (d >= deepen) {
-                if (!obj.parents.empty()) {
+                if (obj.parent_count > 0) {
                     if (new_shallow_set.insert(cur).second) out_shallows.push_back(cur);
                 }
             } else {
                 if (client_shallow_set.count(cur)) {
                     out_unshallows.push_back(cur);
                 }
-                for (const auto& p : obj.parents) {
+                obj.for_each_parent([&](const Oid& p) {
                     if (!commit_depth.count(p)) {
                         commit_depth[p] = d + 1;
                         q.push(p);
                     }
-                }
+                });
             }
         }
     } else {
@@ -325,7 +325,7 @@ void handle_info_refs(ForgeStore& store, Repo& repo, const HttpRequest& req, Htt
     }
 
     if (service == "git-receive-pack") {
-        static constexpr std::string_view kCaps = "report-status side-band-64k delete-refs ofs-delta";
+        static constexpr std::string_view kCaps = "report-status side-band-64k delete-refs";
         // Zero-allocation fast path for 0 or 1 ref (the push benchmark hot path!)
         if (repo.refs.size() <= 1) {
             char buf[512];
@@ -685,8 +685,8 @@ void handle_receive_pack(ForgeStore& store, Repo& repo, const HttpRequest& req, 
                             else { repo.refs.emplace(std::string(ref), new_oid); ok_ref = true; }
                         } else {
                             if (!exists || current != old_oid) ng_reason = " non-fast-forward\n";
-                            else if (repo.objects.find(new_oid) == repo.objects.end()) ng_reason = " missing object\n";
-                            else if (!store.is_ancestor(repo, old_oid, new_oid)) ng_reason = " non-fast-forward\n";
+                            else if (auto oit = repo.objects.find(new_oid); oit == repo.objects.end()) ng_reason = " missing object\n";
+                            else if (!store.is_ancestor_obj(repo, old_oid, new_oid, oit->second)) ng_reason = " non-fast-forward\n";
                             else { rit->second = new_oid; ok_ref = true; }
                         }
                     } else {

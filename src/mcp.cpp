@@ -254,12 +254,12 @@ bool handle_mcp(ForgeStore& store, const HttpRequest& req, HttpResponse& res) {
             std::string state = args.get("state") ? args.get("state")->as_string("open") : "open";
             std::string json = "[";
             bool first = true;
-            for (const auto& up : repo->issues) {
-                if (state == "open" && up->closed) continue;
-                if (state == "closed" && !up->closed) continue;
+            for (const auto& iss : repo->issues) {
+                if (state == "open" && iss.closed) continue;
+                if (state == "closed" && !iss.closed) continue;
                 if (!first) json.push_back(',');
                 first = false;
-                ForgeStore::append_issue_json(*repo, *up, json);
+                ForgeStore::append_issue_json(*repo, iss, json);
             }
             json.push_back(']');
             send_tool_ok(store, req, res, id, json);

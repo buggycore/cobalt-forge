@@ -76,42 +76,59 @@ void split_segments(std::string_view p, std::vector<std::string_view>& out) {
     }
 }
 
-// Fast-path JSON extractor for {"title":"...","body":"..."} without building a JsonValue DOM.
-// Returns true ONLY if the entire JSON object is valid and contains only "title" and optional "body" string fields.
-bool fast_parse_issue_create(std::string_view s, std::string& title_out, std::string& body_out) {
+// Zero-alloc fast-path JSON extractor for {"title":"...","body":"..."} without building a JsonValue DOM.
+bool fast_parse_issue_create(
+    std::string_view s, std::string_view& title_sv, std::string_view& body_sv, std::string& title_buf, std::string& body_buf) {
     size_t i = 0;
     auto skip_ws = [&]() {
         while (i < s.size() && (s[i] == ' ' || s[i] == '\t' || s[i] == '\r' || s[i] == '\n')) ++i;
     };
-    auto parse_str = [&](std::string& out) -> bool {
+    auto parse_str_sv = [&](std::string_view& sv_out, std::string& buf_out) -> bool {
         if (i >= s.size() || s[i] != '"') return false;
         ++i;
-        out.clear();
         size_t start = i;
         while (i < s.size()) {
             unsigned char c = static_cast<unsigned char>(s[i]);
             if (c == '"') {
-                out.append(s.data() + start, i - start);
+                sv_out = s.substr(start, i - start);
                 ++i;
                 return true;
             }
             if (c == '\\') {
-                out.append(s.data() + start, i - start);
-                ++i;
-                if (i >= s.size()) return false;
-                char esc = s[i++];
-                switch (esc) {
-                    case '"': out.push_back('"'); break;
-                    case '\\': out.push_back('\\'); break;
-                    case '/': out.push_back('/'); break;
-                    case 'b': out.push_back('\b'); break;
-                    case 'f': out.push_back('\f'); break;
-                    case 'n': out.push_back('\n'); break;
-                    case 'r': out.push_back('\r'); break;
-                    case 't': out.push_back('\t'); break;
-                    default: return false; // fall back to full JSON parser (e.g., \uXXXX)
+                buf_out.assign(s.data() + start, i - start);
+                for (;;) {
+                    ++i;
+                    if (i >= s.size()) return false;
+                    char esc = s[i++];
+                    switch (esc) {
+                        case '"': buf_out.push_back('"'); break;
+                        case '\\': buf_out.push_back('\\'); break;
+                        case '/': buf_out.push_back('/'); break;
+                        case 'b': buf_out.push_back('\b'); break;
+                        case 'f': buf_out.push_back('\f'); break;
+                        case 'n': buf_out.push_back('\n'); break;
+                        case 'r': buf_out.push_back('\r'); break;
+                        case 't': buf_out.push_back('\t'); break;
+                        default: return false;
+                    }
+                    size_t seg_start = i;
+                    while (i < s.size()) {
+                        unsigned char ch = static_cast<unsigned char>(s[i]);
+                        if (ch == '"') {
+                            buf_out.append(s.data() + seg_start, i - seg_start);
+                            ++i;
+                            sv_out = buf_out;
+                            return true;
+                        }
+                        if (ch == '\\') {
+                            buf_out.append(s.data() + seg_start, i - seg_start);
+                            break;
+                        }
+                        if (ch < 0x20) return false;
+                        ++i;
+                    }
+                    if (i >= s.size()) return false;
                 }
-                start = i;
             } else if (c < 0x20) {
                 return false;
             } else {
@@ -125,29 +142,36 @@ bool fast_parse_issue_create(std::string_view s, std::string& title_out, std::st
     if (i >= s.size() || s[i] != '{') return false;
     ++i;
     skip_ws();
-    if (i < s.size() && s[i] == '}') return false; // missing title -> fall back
+    if (i < s.size() && s[i] == '}') return false;
 
     bool has_title = false;
-    std::string key;
+    title_sv = {};
+    body_sv = {};
     for (;;) {
         skip_ws();
-        if (!parse_str(key)) return false;
+        if (i >= s.size() || s[i] != '"') return false;
+        ++i;
+        size_t kstart = i;
+        while (i < s.size() && s[i] != '"' && s[i] != '\\') ++i;
+        if (i >= s.size() || s[i] != '"') return false;
+        std::string_view key = s.substr(kstart, i - kstart);
+        ++i;
         skip_ws();
         if (i >= s.size() || s[i] != ':') return false;
         ++i;
         skip_ws();
         if (key == "title") {
-            if (!parse_str(title_out)) return false;
-            has_title = !title_out.empty();
+            if (!parse_str_sv(title_sv, title_buf)) return false;
+            has_title = !title_sv.empty();
         } else if (key == "body") {
             if (i + 4 <= s.size() && s.substr(i, 4) == "null") {
-                body_out.clear();
+                body_sv = {};
                 i += 4;
-            } else if (!parse_str(body_out)) {
+            } else if (!parse_str_sv(body_sv, body_buf)) {
                 return false;
             }
         } else {
-            return false; // e.g., labels -> fall back to full JSON parser
+            return false;
         }
         skip_ws();
         if (i >= s.size()) return false;
@@ -250,22 +274,17 @@ bool handle_rest(ForgeStore& store, const HttpRequest& req, HttpResponse& res) {
         size_t s1 = mid.find('/');
         if (s1 != std::string_view::npos && mid.find('/', s1 + 1) == std::string_view::npos &&
             mid.find('%') == std::string_view::npos) {
-            std::string title, ibody;
-            if (fast_parse_issue_create(req.body, title, ibody)) {
+            std::string_view title_sv, body_sv;
+            thread_local std::string title_buf, body_buf;
+            if (fast_parse_issue_create(req.body, title_sv, body_sv, title_buf, body_buf)) {
                 Repo* repo = store.find_repo(mid.substr(0, s1), mid.substr(s1 + 1));
                 if (!repo) {
                     build_error_json(res, 404, "Not Found", store.next_request_id(), req.keep_alive);
                     return true;
                 }
-                static const std::vector<std::string> kNoLabels;
-                std::string err;
-                Issue* iss = store.create_issue(*repo, std::move(title), std::move(ibody), kNoLabels, err);
-                if (!iss) {
-                    build_error_json(res, 422, err, store.next_request_id(), req.keep_alive);
-                    return true;
-                }
-                // Single-pass zero-copy HTTP 201 + JSON into res.owned_raw
-                static std::string jbuf;
+                Issue* iss = store.create_issue_fast(*repo, title_sv, body_sv);
+                // Single-pass zero-alloc HTTP 201 + JSON into res.owned_raw
+                thread_local std::string jbuf;
                 jbuf.clear();
                 jbuf.reserve(128 + iss->title.size() + iss->body.size());
                 ForgeStore::append_issue_json(*repo, *iss, jbuf);
@@ -550,10 +569,10 @@ bool handle_rest(ForgeStore& store, const HttpRequest& req, HttpResponse& res) {
             q.pop();
             auto it = repo->objects.find(cur);
             if (it == repo->objects.end() || it->second.type != ObjType::Commit) continue;
-            store.parse_obj_meta(it->second);
+            store.parse_obj_meta(*repo, it->second);
             if (!first) out.push_back(',');
             first = false;
-            std::string_view msg = ForgeStore::commit_message(it->second);
+            std::string_view msg = ForgeStore::commit_message(*repo, it->second);
             if (!msg.empty() && msg.back() == '\n') msg.remove_suffix(1);
             out += "{\"sha\":";
             append_json_escaped(out, cur.hex());
@@ -563,9 +582,9 @@ bool handle_rest(ForgeStore& store, const HttpRequest& req, HttpResponse& res) {
             append_json_escaped(out, it->second.tree_oid.hex());
             out += "}}}";
             ++emitted;
-            for (const auto& par : it->second.parents) {
+            it->second.for_each_parent([&](const Oid& par) {
                 if (visited.insert(par).second) q.push(par);
-            }
+            });
         }
         out.push_back(']');
         build_json_response(res, 200, out, store.next_request_id(), req.keep_alive);
@@ -592,7 +611,7 @@ bool handle_rest(ForgeStore& store, const HttpRequest& req, HttpResponse& res) {
                 build_error_json(res, 404, "Not Found", store.next_request_id(), req.keep_alive);
                 return true;
             }
-            store.parse_obj_meta(cit->second);
+            store.parse_obj_meta(*repo, cit->second);
             bool is_dir = false;
             Oid target_oid;
             if (!store.lookup_path_in_tree(*repo, cit->second.tree_oid, file_path, is_dir, target_oid)) {
@@ -605,7 +624,7 @@ bool handle_rest(ForgeStore& store, const HttpRequest& req, HttpResponse& res) {
                     build_error_json(res, 404, "Not Found", store.next_request_id(), req.keep_alive);
                     return true;
                 }
-                auto entries = ForgeStore::parse_tree(tit->second.raw);
+                auto entries = ForgeStore::parse_tree(repo->raw_data(tit->second), tit->second.raw_len);
                 std::string out = "[";
                 for (size_t i = 0; i < entries.size(); ++i) {
                     if (i > 0) out.push_back(',');
@@ -614,7 +633,7 @@ bool handle_rest(ForgeStore& store, const HttpRequest& req, HttpResponse& res) {
                     bool d = (e.mode == "40000");
                     size_t sz = 0;
                     if (!d) {
-                        if (auto bit = repo->objects.find(e.oid); bit != repo->objects.end()) sz = bit->second.raw.size();
+                        if (auto bit = repo->objects.find(e.oid); bit != repo->objects.end()) sz = bit->second.raw_len;
                     }
                     out += "{\"type\":";
                     out += d ? "\"dir\"" : "\"file\"";
@@ -639,7 +658,7 @@ bool handle_rest(ForgeStore& store, const HttpRequest& req, HttpResponse& res) {
                 }
                 size_t slash = file_path.rfind('/');
                 std::string name = (slash == std::string::npos) ? file_path : file_path.substr(slash + 1);
-                std::string b64 = base64_encode(bit->second.raw.data(), bit->second.raw.size());
+                std::string b64 = base64_encode(repo->raw_data(bit->second), bit->second.raw_len);
                 std::string out = "{\"type\":\"file\",\"encoding\":\"base64\",\"name\":";
                 append_json_escaped(out, name);
                 out += ",\"path\":";
@@ -647,7 +666,7 @@ bool handle_rest(ForgeStore& store, const HttpRequest& req, HttpResponse& res) {
                 out += ",\"sha\":";
                 append_json_escaped(out, target_oid.hex());
                 out += ",\"size\":";
-                out += std::to_string(bit->second.raw.size());
+                out += std::to_string(bit->second.raw_len);
                 out += ",\"content\":";
                 append_json_escaped(out, b64);
                 out += "}";
@@ -811,10 +830,10 @@ bool handle_rest(ForgeStore& store, const HttpRequest& req, HttpResponse& res) {
 
                 std::vector<const Issue*> list;
                 list.reserve(repo->issues.size());
-                for (const auto& up : repo->issues) {
-                    if (state == "open" && up->closed) continue;
-                    if (state == "closed" && !up->closed) continue;
-                    list.push_back(up.get());
+                for (const auto& iss : repo->issues) {
+                    if (state == "open" && iss.closed) continue;
+                    if (state == "closed" && !iss.closed) continue;
+                    list.push_back(&iss);
                 }
                 if (asc) {
                     std::sort(list.begin(), list.end(), [](const Issue* a, const Issue* b) {

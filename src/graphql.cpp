@@ -497,12 +497,12 @@ JsonValue resolve_repo(ForgeStore& store, Repo& repo, const std::vector<GqlSelec
 
             std::vector<const Issue*> list;
             list.reserve(repo.issues.size());
-            for (const auto& up : repo.issues) {
+            for (const auto& iss : repo.issues) {
                 if (has_states) {
-                    if (!up->closed && !filter_open) continue;
-                    if (up->closed && !filter_closed) continue;
+                    if (!iss.closed && !filter_open) continue;
+                    if (iss.closed && !filter_closed) continue;
                 }
-                list.push_back(up.get());
+                list.push_back(&iss);
             }
             if (desc) {
                 std::sort(list.begin(), list.end(), [](const Issue* a, const Issue* b) {
