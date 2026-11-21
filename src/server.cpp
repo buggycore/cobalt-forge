@@ -7,14 +7,15 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <fcntl.h>
 #include <memory>
 #include <mutex>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
-#include <poll.h>
 #include <pthread.h>
 #include <string>
 #include <string_view>
+#include <sys/epoll.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
@@ -337,7 +338,7 @@ struct HotIssue {
 struct HotClone {
     std::string owner_repo; // "owner/repo" (without .git)
     std::string ls_refs_http;
-    forge::Oid want0{};
+    char want0_hex[40]{};
     bool has_fetch = false;
     std::string fetch_http;
 };
@@ -346,22 +347,18 @@ struct ServerCtx {
     forge::ForgeStore* store = nullptr;
     std::mutex store_mu;
 
-    // Lock-free atomic L1 pointers (1 mov instruction on x86-64, zero contention across 50 clone threads!)
     std::atomic<const HotIssue*> hot_issue{nullptr};
     std::atomic<const HotClone*> hot_clone{nullptr};
 
-    // Active connection counter so /done is ONLY polled when completely idle
-    std::atomic<int> active_conns{0};
-
-    // Append-only arenas owned under store_mu so concurrent readers never hit use-after-free
     std::vector<std::unique_ptr<HotIssue>> issue_arena;
     std::vector<std::unique_ptr<HotClone>> clone_arena;
 
-    std::mutex pool_mu;
-    std::condition_variable pool_cv;
-    std::vector<int> fd_queue;
-    size_t idle_workers = 0;
-    size_t total_workers = 0;
+    // Single dedicated Hot Blocking Worker for sequential keep-alive workloads (2 syscalls/req!)
+    std::mutex hot_mu;
+    std::condition_variable hot_cv;
+    int hot_fd = -1;
+    bool hot_stop = false;
+    std::atomic<bool> hot_busy{false};
 };
 
 inline bool split_git_path(
@@ -430,7 +427,7 @@ bool try_lockfree_fast(const ServerCtx& ctx, const forge::HttpRequest& req, cons
         bool in_args = false;
         bool peel = false, symrefs = false, has_prefix = false;
         int deepen = 0, want_count = 0, have_count = 0, shallow_count = 0;
-        forge::Oid want0{};
+        const char* want0_ptr = nullptr;
 
         while (pos + 4 <= buf.size()) {
             unsigned len = 0;
@@ -453,7 +450,7 @@ bool try_lockfree_fast(const ServerCtx& ctx, const forge::HttpRequest& req, cons
                 else if (line.size() >= 11 && line.substr(0, 11) == "ref-prefix ") has_prefix = true;
             } else if (command == "fetch") {
                 if (line.size() == 45 && line.substr(0, 5) == "want ") {
-                    if (want_count == 0 && !forge::parse_oid(line.substr(5), want0)) return false;
+                    if (want_count == 0) want0_ptr = line.data() + 5;
                     ++want_count;
                 } else if (line.size() == 45 && line.substr(0, 5) == "have ") {
                     ++have_count;
@@ -476,7 +473,7 @@ bool try_lockfree_fast(const ServerCtx& ctx, const forge::HttpRequest& req, cons
             return true;
         }
         if (command == "fetch" && deepen == 1 && want_count == 1 && have_count == 0 && shallow_count == 0 &&
-            c->has_fetch && want0 == c->want0) {
+            c->has_fetch && want0_ptr && std::memcmp(want0_ptr, c->want0_hex, 40) == 0) {
             out_ptr = c->fetch_http.data();
             out_len = c->fetch_http.size();
             return true;
@@ -485,14 +482,63 @@ bool try_lockfree_fast(const ServerCtx& ctx, const forge::HttpRequest& req, cons
     return false;
 }
 
-void dispatch_request(forge::ForgeStore& store, const forge::HttpRequest& req, forge::HttpResponse& res) {
-    if (forge::try_rest_fast_readonly(store, req, res)) return;
-    if (forge::try_git_fast_readonly(store, req, res)) return;
-    if (forge::handle_rest(store, req, res)) return;
-    if (forge::handle_graphql(store, req, res)) return;
-    if (forge::handle_mcp(store, req, res)) return;
-    if (forge::handle_git_http(store, req, res)) return;
-    forge::build_error_json(res, 404, "Not Found", store.next_request_id(), req.keep_alive);
+void dispatch_under_lock(ServerCtx& ctx, const forge::HttpRequest& req, forge::HttpResponse& res) {
+    // Invalidate L1 lock-free caches on any mutating method/route
+    std::string_view git_owner, git_repo, git_tail;
+    bool is_git_ro = split_git_path(req.path, git_owner, git_repo, git_tail) &&
+                     ((req.method == "GET" && git_tail == "/info/refs") ||
+                      (req.method == "POST" && git_tail == "/git-upload-pack"));
+    if (req.method != "GET" && !is_git_ro) {
+        ctx.hot_issue.store(nullptr, std::memory_order_release);
+        ctx.hot_clone.store(nullptr, std::memory_order_release);
+    }
+
+    if (req.method == "GET" && req.path == "/healthz") {
+        forge::build_json_response(res, 200, "{\"ok\":true}", ctx.store->next_request_id(), req.keep_alive);
+        return;
+    }
+
+    if (!forge::try_rest_fast_readonly(*ctx.store, req, res) &&
+        !forge::try_git_fast_readonly(*ctx.store, req, res) &&
+        !forge::handle_rest(*ctx.store, req, res) &&
+        !forge::handle_graphql(*ctx.store, req, res) &&
+        !forge::handle_mcp(*ctx.store, req, res) &&
+        !forge::handle_git_http(*ctx.store, req, res)) {
+        forge::build_error_json(res, 404, "Not Found", ctx.store->next_request_id(), req.keep_alive);
+        return;
+    }
+
+    // Publish immutable L1 lock-free cache entries on cacheable hits
+    if (req.keep_alive) {
+        if (req.method == "GET" && req.query.empty() && res.raw_ptr != nullptr &&
+            req.path.size() > 14 && req.path.substr(0, 14) == "/api/v3/repos/" &&
+            req.path.find("/issues/") != std::string_view::npos) {
+            auto entry = std::make_unique<HotIssue>();
+            entry->path.assign(req.path);
+            entry->raw_http.assign(res.raw_ptr, res.raw_len);
+            const HotIssue* ptr = entry.get();
+            ctx.issue_arena.push_back(std::move(entry));
+            ctx.hot_issue.store(ptr, std::memory_order_release);
+        } else if (is_git_ro && req.method == "POST" && git_tail == "/git-upload-pack") {
+            forge::Repo* r = ctx.store->find_repo(git_owner, git_repo);
+            if (r && (!r->cached_ls_refs_http.empty() || !r->shallow1_http_cache.empty())) {
+                auto entry = std::make_unique<HotClone>();
+                entry->owner_repo = std::string(git_owner) + "/" + std::string(git_repo);
+                if (r->cached_ls_refs_version == r->ref_version && !r->cached_ls_refs_http.empty()) {
+                    entry->ls_refs_http = r->cached_ls_refs_http;
+                }
+                if (!r->shallow1_http_cache.empty()) {
+                    auto it = r->shallow1_http_cache.begin();
+                    it->first.write_hex(entry->want0_hex);
+                    entry->fetch_http = it->second;
+                    entry->has_fetch = true;
+                }
+                const HotClone* ptr = entry.get();
+                ctx.clone_arena.push_back(std::move(entry));
+                ctx.hot_clone.store(ptr, std::memory_order_release);
+            }
+        }
+    }
 }
 
 int64_t parse_trial_epoch(const char* env_val) {
@@ -511,14 +557,23 @@ int64_t parse_trial_epoch(const char* env_val) {
     return 1735689600;
 }
 
-void handle_connection(int fd, ServerCtx& ctx, std::string& rbuf, ParsedReq& parsed, forge::HttpResponse& res) {
-    static const std::string kHealthOk =
-        "HTTP/1.1 200 OK\r\n"
-        "Content-Type: application/json\r\n"
-        "X-GitHub-Request-Id: 1\r\n"
-        "Content-Length: 11\r\n\r\n"
-        "{\"ok\":true}";
+static const std::string kHealthOk =
+    "HTTP/1.1 200 OK\r\n"
+    "Content-Type: application/json\r\n"
+    "X-GitHub-Request-Id: 1\r\n"
+    "Content-Length: 11\r\n\r\n"
+    "{\"ok\":true}";
 
+static constexpr char kBadReq[] =
+    "HTTP/1.1 400 Bad Request\r\n"
+    "Content-Type: application/json\r\n"
+    "X-GitHub-Request-Id: 1\r\n"
+    "Connection: close\r\n"
+    "Content-Length: 25\r\n\r\n"
+    "{\"message\":\"Bad Request\"}";
+
+// Dedicated 2-syscall/req blocking loop for the single promoted hot keep-alive connection.
+void handle_blocking_conn(int fd, ServerCtx& ctx, std::string& rbuf, ParsedReq& parsed, forge::HttpResponse& res) {
     size_t rpos = 0;
     size_t rlen = 0;
 
@@ -527,26 +582,17 @@ void handle_connection(int fd, ServerCtx& ctx, std::string& rbuf, ParsedReq& par
             ParseStatus st = try_parse_request(rbuf.data(), rpos, rlen, parsed);
             if (st == ParseStatus::Incomplete) break;
             if (st == ParseStatus::Error) {
-                static constexpr char kBadReq[] =
-                    "HTTP/1.1 400 Bad Request\r\n"
-                    "Content-Type: application/json\r\n"
-                    "X-GitHub-Request-Id: 1\r\n"
-                    "Connection: close\r\n"
-                    "Content-Length: 25\r\n\r\n"
-                    "{\"message\":\"Bad Request\"}";
                 write_all(fd, kBadReq, sizeof(kBadReq) - 1);
                 return;
             }
             rpos += parsed.total_consumed;
             const auto& req = parsed.req;
 
-            // 1. Lock-free /healthz
             if (req.method == "GET" && req.path == "/healthz" && req.keep_alive) {
                 if (!write_all(fd, kHealthOk.data(), kHealthOk.size())) return;
                 continue;
             }
 
-            // 2. Lock-free L1 atomic cache hit (GET /issues/{n}, Git v2 clone)
             const char* fast_ptr = nullptr;
             size_t fast_len = 0;
             if (try_lockfree_fast(ctx, req, fast_ptr, fast_len)) {
@@ -554,61 +600,12 @@ void handle_connection(int fd, ServerCtx& ctx, std::string& rbuf, ParsedReq& par
                 continue;
             }
 
-            // 3. Synchronized path under store_mu; release mutex BEFORE write() when owned_raw is used!
             bool send_ok = true;
             res.raw_ptr = nullptr;
             res.raw_len = 0;
             {
                 std::lock_guard<std::mutex> lk(ctx.store_mu);
-
-                // Invalidate L1 lock-free caches on any mutating method/route
-                std::string_view git_owner, git_repo, git_tail;
-                bool is_git_ro = split_git_path(req.path, git_owner, git_repo, git_tail) &&
-                                 ((req.method == "GET" && git_tail == "/info/refs") ||
-                                  (req.method == "POST" && git_tail == "/git-upload-pack"));
-                if (req.method != "GET" && !is_git_ro) {
-                    ctx.hot_issue.store(nullptr, std::memory_order_release);
-                    ctx.hot_clone.store(nullptr, std::memory_order_release);
-                }
-
-                if (req.method == "GET" && req.path == "/healthz") {
-                    forge::build_json_response(res, 200, "{\"ok\":true}", ctx.store->next_request_id(), req.keep_alive);
-                } else {
-                    dispatch_request(*ctx.store, req, res);
-                }
-
-                // Publish immutable L1 lock-free cache entries on cacheable hits
-                if (req.keep_alive) {
-                    if (req.method == "GET" && req.query.empty() && res.raw_ptr != nullptr &&
-                        req.path.size() > 14 && req.path.substr(0, 14) == "/api/v3/repos/" &&
-                        req.path.find("/issues/") != std::string_view::npos) {
-                        auto entry = std::make_unique<HotIssue>();
-                        entry->path.assign(req.path);
-                        entry->raw_http.assign(res.raw_ptr, res.raw_len);
-                        const HotIssue* ptr = entry.get();
-                        ctx.issue_arena.push_back(std::move(entry));
-                        ctx.hot_issue.store(ptr, std::memory_order_release);
-                    } else if (is_git_ro && req.method == "POST" && git_tail == "/git-upload-pack") {
-                        forge::Repo* r = ctx.store->find_repo(git_owner, git_repo);
-                        if (r && (!r->cached_ls_refs_http.empty() || !r->shallow1_http_cache.empty())) {
-                            auto entry = std::make_unique<HotClone>();
-                            entry->owner_repo = std::string(git_owner) + "/" + std::string(git_repo);
-                            if (r->cached_ls_refs_version == r->ref_version && !r->cached_ls_refs_http.empty()) {
-                                entry->ls_refs_http = r->cached_ls_refs_http;
-                            }
-                            if (!r->shallow1_http_cache.empty()) {
-                                auto it = r->shallow1_http_cache.begin();
-                                entry->want0 = it->first;
-                                entry->fetch_http = it->second;
-                                entry->has_fetch = true;
-                            }
-                            const HotClone* ptr = entry.get();
-                            ctx.clone_arena.push_back(std::move(entry));
-                            ctx.hot_clone.store(ptr, std::memory_order_release);
-                        }
-                    }
-                }
-
+                dispatch_under_lock(ctx, req, res);
                 if (res.raw_ptr != nullptr) {
                     send_ok = write_all(fd, res.raw_ptr, res.raw_len);
                 }
@@ -648,7 +645,7 @@ void handle_connection(int fd, ServerCtx& ctx, std::string& rbuf, ParsedReq& par
     }
 }
 
-void* worker_entry(void* arg) {
+void* hot_worker_entry(void* arg) {
     auto* ctx = static_cast<ServerCtx*>(arg);
     std::string rbuf(16384, '\0');
     ParsedReq parsed;
@@ -658,17 +655,15 @@ void* worker_entry(void* arg) {
     for (;;) {
         int fd = -1;
         {
-            std::unique_lock<std::mutex> lk(ctx->pool_mu);
-            ++ctx->idle_workers;
-            ctx->pool_cv.wait(lk, [&] { return !ctx->fd_queue.empty(); });
-            --ctx->idle_workers;
-            fd = ctx->fd_queue.back();
-            ctx->fd_queue.pop_back();
+            std::unique_lock<std::mutex> lk(ctx->hot_mu);
+            ctx->hot_cv.wait(lk, [&] { return ctx->hot_fd >= 0 || ctx->hot_stop; });
+            if (ctx->hot_stop) break;
+            fd = ctx->hot_fd;
+            ctx->hot_fd = -1;
         }
-        ctx->active_conns.fetch_add(1, std::memory_order_relaxed);
-        handle_connection(fd, *ctx, rbuf, parsed, res);
+        handle_blocking_conn(fd, *ctx, rbuf, parsed, res);
         close(fd);
-        ctx->active_conns.fetch_sub(1, std::memory_order_relaxed);
+        ctx->hot_busy.store(false, std::memory_order_release);
         if (rbuf.size() > 65536) {
             std::string shrunk(16384, '\0');
             rbuf.swap(shrunk);
@@ -677,15 +672,29 @@ void* worker_entry(void* arg) {
     return nullptr;
 }
 
-void spawn_worker(ServerCtx* ctx) {
-    pthread_attr_t attr;
-    pthread_attr_init(&attr);
-    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-    pthread_attr_setstacksize(&attr, 192 * 1024);
-    pthread_t tid{};
-    pthread_create(&tid, &attr, worker_entry, ctx);
-    pthread_attr_destroy(&attr);
-}
+struct EpollConn {
+    int fd = -1;
+    bool active = false;
+    uint32_t req_count = 0;
+    std::string rbuf;
+    size_t rpos = 0;
+    std::string wbuf;
+    size_t wpos = 0;
+    bool close_after_write = false;
+    bool epoll_out = false;
+
+    void reset() noexcept {
+        fd = -1;
+        active = false;
+        req_count = 0;
+        rbuf.clear();
+        rpos = 0;
+        wbuf.clear();
+        wpos = 0;
+        close_after_write = false;
+        epoll_out = false;
+    }
+};
 
 } // namespace
 
@@ -719,14 +728,16 @@ int main(int argc, char** argv) {
     forge::ForgeStore store(std::move(viewer_login), std::move(auth_token), base_epoch);
     ServerCtx ctx;
     ctx.store = &store;
-    ctx.fd_queue.reserve(128);
 
-    // Pre-warm 56 workers before /register so 50-way concurrent clone needs ZERO pthread_create calls!
-    constexpr size_t kInitialWorkers = 56;
-    constexpr size_t kMaxWorkers = 180;
-    ctx.total_workers = kInitialWorkers;
-    for (size_t i = 0; i < kInitialWorkers; ++i) {
-        spawn_worker(&ctx);
+    // Launch ONLY 1 helper thread: the dedicated Hot Blocking Worker (total process threads = 2!).
+    pthread_t hot_tid{};
+    {
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+        pthread_attr_setstacksize(&attr, 256 * 1024);
+        pthread_create(&hot_tid, &attr, hot_worker_entry, &ctx);
+        pthread_attr_destroy(&attr);
     }
 
     int listen_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
@@ -790,60 +801,311 @@ int main(int argc, char** argv) {
         std::fflush(stdout);
     }
 
-    int batch[64];
-    timeval ctv{};
-    ctv.tv_sec = 1;
-    ctv.tv_usec = 500000;
+    int epfd = epoll_create1(EPOLL_CLOEXEC);
+    if (epfd < 0) {
+        std::perror("epoll_create1");
+        close(listen_fd);
+        return 1;
+    }
+
+    epoll_event lev{};
+    lev.events = EPOLLIN;
+    lev.data.fd = listen_fd;
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, listen_fd, &lev) < 0) {
+        std::perror("epoll_ctl listen");
+        close(epfd);
+        close(listen_fd);
+        return 1;
+    }
+
+    std::vector<EpollConn> conns(512);
+
+    auto close_conn = [&](int fd) {
+        epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
+        close(fd);
+        if (fd >= 0 && static_cast<size_t>(fd) < conns.size()) {
+            conns[static_cast<size_t>(fd)].reset();
+        }
+    };
+
+    auto set_epoll_out = [&](EpollConn& c, bool enable) {
+        if (c.epoll_out == enable) return;
+        epoll_event ev{};
+        ev.events = static_cast<uint32_t>(EPOLLIN) | (enable ? static_cast<uint32_t>(EPOLLOUT) : 0u);
+        ev.data.fd = c.fd;
+        epoll_ctl(epfd, EPOLL_CTL_MOD, c.fd, &ev);
+        c.epoll_out = enable;
+    };
+
+    auto flush_write = [&](EpollConn& c) -> bool {
+        while (c.wpos < c.wbuf.size()) {
+            ssize_t n = write(c.fd, c.wbuf.data() + c.wpos, c.wbuf.size() - c.wpos);
+            if (n > 0) {
+                c.wpos += static_cast<size_t>(n);
+            } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                set_epoll_out(c, true);
+                return true;
+            } else {
+                return false;
+            }
+        }
+        c.wbuf.clear();
+        c.wpos = 0;
+        set_epoll_out(c, false);
+        return !c.close_after_write;
+    };
+
+    auto send_response = [&](EpollConn& c, const char* data, size_t len, bool close_conn_after) -> bool {
+        if (close_conn_after) c.close_after_write = true;
+        if (c.wbuf.empty()) {
+            size_t sent = 0;
+            while (sent < len) {
+                ssize_t n = write(c.fd, data + sent, len - sent);
+                if (n > 0) {
+                    sent += static_cast<size_t>(n);
+                } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                    c.wbuf.assign(data + sent, len - sent);
+                    c.wpos = 0;
+                    set_epoll_out(c, true);
+                    return true;
+                } else {
+                    return false;
+                }
+            }
+            return !c.close_after_write;
+        }
+        c.wbuf.append(data, len);
+        return flush_write(c);
+    };
+
+    auto promote_to_hot = [&](EpollConn& c) {
+        int fd = c.fd;
+        epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
+        c.reset();
+        int fl = fcntl(fd, F_GETFL, 0);
+        if (fl >= 0) fcntl(fd, F_SETFL, fl & ~O_NONBLOCK);
+        timeval htv{};
+        htv.tv_sec = 0;
+        htv.tv_usec = 350000;
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &htv, sizeof(htv));
+        ctx.hot_busy.store(true, std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> lk(ctx.hot_mu);
+            ctx.hot_fd = fd;
+        }
+        ctx.hot_cv.notify_one();
+    };
+
+    std::vector<epoll_event> events(128);
+    char fast_buf[65536];
+    ParsedReq parsed;
+    forge::HttpResponse res;
+    res.owned_raw.reserve(8192);
+    uint32_t burst_cooldown = 0;
 
     while (!g_stop) {
-        pollfd pfd{};
-        pfd.fd = listen_fd;
-        pfd.events = POLLIN;
-        int pr = poll(&pfd, 1, env_mode ? 1500 : -1);
-        if (pr == 0) {
-            // Never interrupt active benchmarks with /done HTTP probes
-            if (env_mode && ctx.active_conns.load(std::memory_order_relaxed) == 0) {
+        int nfds = epoll_wait(epfd, events.data(), static_cast<int>(events.size()), env_mode ? 400 : -1);
+        if (nfds < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (nfds == 0) {
+            if (env_mode && !ctx.hot_busy.load(std::memory_order_acquire)) {
                 if (poll_env_done(env_ip, env_port, done_req)) break;
             }
             continue;
         }
-        if (pr < 0) {
-            if (errno == EINTR && !g_stop) continue;
-            break;
+        if (nfds > 1) {
+            burst_cooldown = 4;
+        } else if (burst_cooldown > 0) {
+            --burst_cooldown;
         }
 
-        size_t accepted = 0;
-        while (accepted < 64) {
-            sockaddr_in caddr{};
-            socklen_t clen = sizeof(caddr);
-            int cfd = accept4(listen_fd, reinterpret_cast<sockaddr*>(&caddr), &clen, SOCK_CLOEXEC);
-            if (cfd < 0) {
-                if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) break;
-                break;
-            }
-            int nodelay = 1;
-            setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
-            setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &ctv, sizeof(ctv));
-            batch[accepted++] = cfd;
-        }
-        if (accepted == 0) continue;
+        for (int i = 0; i < nfds; ++i) {
+            int fd = events[i].data.fd;
+            uint32_t ev = events[i].events;
 
-        {
-            std::lock_guard<std::mutex> lk(ctx.pool_mu);
-            for (size_t i = 0; i < accepted; ++i) {
-                ctx.fd_queue.push_back(batch[i]);
+            if (fd == listen_fd) {
+                size_t acc_cnt = 0;
+                for (;;) {
+                    sockaddr_in caddr{};
+                    socklen_t clen = sizeof(caddr);
+                    int cfd = accept4(listen_fd, reinterpret_cast<sockaddr*>(&caddr), &clen, SOCK_NONBLOCK | SOCK_CLOEXEC);
+                    if (cfd < 0) {
+                        if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                        break;
+                    }
+                    ++acc_cnt;
+                    int nodelay = 1;
+                    setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+                    epoll_event cev{};
+                    cev.events = EPOLLIN;
+                    cev.data.fd = cfd;
+                    if (epoll_ctl(epfd, EPOLL_CTL_ADD, cfd, &cev) < 0) {
+                        close(cfd);
+                        continue;
+                    }
+                    if (static_cast<size_t>(cfd) >= conns.size()) {
+                        conns.resize(static_cast<size_t>(cfd) + 64);
+                    }
+                    EpollConn& nc = conns[static_cast<size_t>(cfd)];
+                    nc.reset();
+                    nc.fd = cfd;
+                    nc.active = true;
+                }
+                if (acc_cnt > 1) burst_cooldown = 4;
+                continue;
             }
-            while (ctx.fd_queue.size() > ctx.idle_workers && ctx.total_workers < kMaxWorkers) {
-                ++ctx.total_workers;
-                spawn_worker(&ctx);
+
+            if (fd < 0 || static_cast<size_t>(fd) >= conns.size() || !conns[static_cast<size_t>(fd)].active) continue;
+            EpollConn& c = conns[static_cast<size_t>(fd)];
+
+            if (ev & (EPOLLERR | EPOLLHUP)) {
+                close_conn(fd);
+                continue;
             }
-        }
-        // Wake EXACTLY the number of accepted connections (zero thundering herd!)
-        for (size_t i = 0; i < accepted; ++i) {
-            ctx.pool_cv.notify_one();
+
+            if (ev & EPOLLOUT) {
+                if (!flush_write(c)) {
+                    close_conn(fd);
+                    continue;
+                }
+            }
+
+            if (ev & EPOLLIN) {
+                auto handle_one = [&](const forge::HttpRequest& req) -> bool {
+                    ++c.req_count;
+                    if (req.method == "GET" && req.path == "/healthz" && req.keep_alive) {
+                        return send_response(c, kHealthOk.data(), kHealthOk.size(), false);
+                    }
+                    const char* fast_ptr = nullptr;
+                    size_t fast_len = 0;
+                    if (try_lockfree_fast(ctx, req, fast_ptr, fast_len)) {
+                        return send_response(c, fast_ptr, fast_len, false);
+                    }
+                    res.raw_ptr = nullptr;
+                    res.raw_len = 0;
+                    bool ok = true;
+                    {
+                        std::lock_guard<std::mutex> lk(ctx.store_mu);
+                        dispatch_under_lock(ctx, req, res);
+                        if (res.raw_ptr != nullptr) {
+                            ok = send_response(c, res.raw_ptr, res.raw_len, !req.keep_alive);
+                        }
+                    }
+                    if (res.raw_ptr == nullptr) {
+                        ok = send_response(c, res.owned_raw.data(), res.owned_raw.size(), !req.keep_alive);
+                    }
+                    return ok;
+                };
+
+                if (c.rbuf.empty()) {
+                    ssize_t n = read(fd, fast_buf, sizeof(fast_buf));
+                    if (n > 0) {
+                        size_t pos = 0;
+                        size_t len = static_cast<size_t>(n);
+                        bool alive = true;
+                        while (alive && pos < len) {
+                            ParseStatus st = try_parse_request(fast_buf, pos, len, parsed);
+                            if (st == ParseStatus::Incomplete) {
+                                c.rbuf.assign(fast_buf + pos, len - pos);
+                                c.rpos = 0;
+                                pos = len;
+                                break;
+                            }
+                            if (st == ParseStatus::Error) {
+                                send_response(c, kBadReq, sizeof(kBadReq) - 1, true);
+                                alive = false;
+                                break;
+                            }
+                            pos += parsed.total_consumed;
+                            if (!handle_one(parsed.req)) {
+                                alive = false;
+                                break;
+                            }
+                        }
+                        if (!alive) {
+                            close_conn(fd);
+                        } else if (nfds == 1 && burst_cooldown == 0 && c.req_count >= 4 && c.rbuf.empty() && c.wbuf.empty() &&
+                                   !c.close_after_write && !ctx.hot_busy.load(std::memory_order_relaxed)) {
+                            promote_to_hot(c);
+                        }
+                        continue;
+                    } else if (n == 0) {
+                        if (c.wbuf.empty()) close_conn(fd);
+                        continue;
+                    } else {
+                        if (errno != EAGAIN && errno != EWOULDBLOCK) close_conn(fd);
+                        continue;
+                    }
+                }
+
+                bool peer_closed = false;
+                bool fatal = false;
+                for (;;) {
+                    ssize_t n = read(fd, fast_buf, sizeof(fast_buf));
+                    if (n > 0) {
+                        c.rbuf.append(fast_buf, static_cast<size_t>(n));
+                        if (n < static_cast<ssize_t>(sizeof(fast_buf))) break;
+                    } else if (n == 0) {
+                        peer_closed = true;
+                        break;
+                    } else {
+                        if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                        fatal = true;
+                        break;
+                    }
+                }
+                if (fatal) {
+                    close_conn(fd);
+                    continue;
+                }
+
+                bool alive = true;
+                while (alive && c.rpos < c.rbuf.size()) {
+                    ParseStatus st = try_parse_request(c.rbuf.data(), c.rpos, c.rbuf.size(), parsed);
+                    if (st == ParseStatus::Incomplete) break;
+                    if (st == ParseStatus::Error) {
+                        send_response(c, kBadReq, sizeof(kBadReq) - 1, true);
+                        alive = false;
+                        break;
+                    }
+                    c.rpos += parsed.total_consumed;
+                    if (!handle_one(parsed.req)) {
+                        alive = false;
+                        break;
+                    }
+                }
+
+                if (!alive) {
+                    close_conn(fd);
+                    continue;
+                }
+
+                if (c.rpos > 0) {
+                    if (c.rpos == c.rbuf.size()) {
+                        c.rbuf.clear();
+                        c.rpos = 0;
+                    } else if (c.rpos > 32768) {
+                        c.rbuf.erase(0, c.rpos);
+                        c.rpos = 0;
+                    }
+                }
+
+                if (peer_closed && c.wbuf.empty()) {
+                    close_conn(fd);
+                } else if (nfds == 1 && burst_cooldown == 0 && c.req_count >= 4 && c.rbuf.empty() && c.wbuf.empty() &&
+                           !c.close_after_write && !ctx.hot_busy.load(std::memory_order_relaxed)) {
+                    promote_to_hot(c);
+                }
+            }
         }
     }
 
+    for (auto& c : conns) {
+        if (c.active) close(c.fd);
+    }
+    close(epfd);
     close(listen_fd);
     _exit(0);
 }
